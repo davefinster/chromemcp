@@ -1,0 +1,7 @@
+# the locally built binary — the image builds its own
+chromemcp
+*.log
+.claude/
+.git/
+.github/
+README.md
