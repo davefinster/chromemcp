@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -278,6 +279,20 @@ func TestDeviceIntegration(t *testing.T) {
 				t.Errorf("%s: font %q present=%v, want %v (%v)", where, name, fp.Fonts[name], want, fp.Fonts)
 			}
 		}
+		// The CSS generic families carry Windows metrics: `fantasy` (Blink
+		// resolves it to Impact, condensed) measures clearly narrower than
+		// the `system-ui` body font (Segoe UI). A font-fingerprinting script
+		// that finds fantasy wider than the UI font reads the box as Firefox
+		// on Linux; this relationship is what keeps it reading as Windows.
+		var gm struct{ Fantasy, System int }
+		if out, err := evaluate(ctx, tb, `(() => { const c=document.createElement('div');c.style.cssText='position:absolute;left:-9999px';document.body.appendChild(c);const m=f=>{const e=document.createElement('span');e.style.fontSize='72px';e.style.fontFamily=f;e.textContent='mmmmmmmmmmlliWWWW';c.appendChild(e);return e.offsetWidth;};const r={fantasy:m('fantasy'),system:m('system-ui')};c.remove();return r;})()`, 5*time.Second); err == nil {
+			json.Unmarshal([]byte(out), &gm)
+		} else {
+			t.Errorf("%s: font metric probe: %v", where, err)
+		}
+		if gm.Fantasy == 0 || gm.Fantasy >= gm.System || gm.Fantasy >= 900 {
+			t.Errorf("%s: generic font metrics fantasy=%d system=%d (want fantasy < system and < 900)", where, gm.Fantasy, gm.System)
+		}
 		var w struct {
 			UserAgent     string   `json:"userAgent"`
 			Platform      string   `json:"platform"`
@@ -316,8 +331,11 @@ func TestDeviceIntegration(t *testing.T) {
 				t.Errorf("%s headers: %v", p, h)
 			}
 		}
-		// A popup: its first request has the user agent from the command
-		// line; by the time its scripts run, the whole profile.
+		// A popup: the browser dispatches its first request before the
+		// per-target override can reach the new tab, so the user agent
+		// comes from the command line and the client-hint platform from
+		// the emulator's request stamping (both must be Windows), and by
+		// the time its scripts run the whole profile is in place.
 		res, err := resolveTarget(ctx, tb, targetSpec{Text: "open popup"})
 		if err != nil {
 			return err
@@ -325,8 +343,8 @@ func TestDeviceIntegration(t *testing.T) {
 		if err := clickAt(ctx, tb, res.X, res.Y, "left", 1, 0); err != nil {
 			return err
 		}
-		if h := es.last("/popup"); h == nil || h.Get("User-Agent") != winUA {
-			t.Errorf("popup headers: %v", h)
+		if h := es.last("/popup"); h == nil || h.Get("User-Agent") != winUA || h.Get("Sec-CH-UA-Platform") != `"Windows"` {
+			t.Errorf("popup headers: UA=%q platform=%q", h.Get("User-Agent"), h.Get("Sec-CH-UA-Platform"))
 		}
 		time.Sleep(500 * time.Millisecond)
 		if err := s.syncTabs(ctx); err != nil {
@@ -452,5 +470,67 @@ func TestWindowsFontsConf(t *testing.T) {
 	}
 	if p, _ := deviceProfiles["default"].fontsConfFile(dir, installed); p != "" {
 		t.Error("default profile has a fonts file")
+	}
+}
+
+func TestClientHintHeaders(t *testing.T) {
+	ver := chromeVersion{Full: "152.0.7977.82", Major: "152"}
+	if h := deviceProfiles["default"].clientHintHeaders(ver); h != nil {
+		t.Errorf("default has client-hint headers: %v", h)
+	}
+	h := deviceProfiles["windows"].clientHintHeaders(ver)
+	if h["sec-ch-ua-platform"] != `"Windows"` || h["sec-ch-ua-mobile"] != "?0" {
+		t.Errorf("headers: %v", h)
+	}
+	if h["sec-ch-ua"] != `"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"` {
+		t.Errorf("sec-ch-ua: %q", h["sec-ch-ua"])
+	}
+}
+
+func TestFontPrefs(t *testing.T) {
+	if deviceProfiles["default"].fontPrefs() != nil {
+		t.Error("default has font prefs")
+	}
+	p := deviceProfiles["windows"].fontPrefs()
+	fonts := p["webkit"].(map[string]any)["webprefs"].(map[string]any)["fonts"].(map[string]any)
+	if fonts["fantasy"].(map[string]any)["Zyyy"] != "Impact" {
+		t.Errorf("fantasy pref: %v", fonts["fantasy"])
+	}
+	if fonts["sansserif"].(map[string]any)["Zyyy"] != "Arial" {
+		t.Errorf("sansserif pref: %v", fonts["sansserif"])
+	}
+}
+
+func TestMergeProfilePrefs(t *testing.T) {
+	dir := t.TempDir()
+	// nil prefs: nothing written.
+	if err := mergeProfilePrefs(dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "Default", "Preferences")); err == nil {
+		t.Error("nil prefs wrote a file")
+	}
+	// Existing Preferences with unrelated settings survive the merge.
+	os.MkdirAll(filepath.Join(dir, "Default"), 0o700)
+	os.WriteFile(filepath.Join(dir, "Default", "Preferences"),
+		[]byte(`{"profile":{"name":"me"},"webkit":{"webprefs":{"fonts":{"fantasy":{"Zyyy":"OldFont"}},"other":1}}}`), 0o600)
+	if err := mergeProfilePrefs(dir, deviceProfiles["windows"].fontPrefs()); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "Default", "Preferences"))
+	var got map[string]any
+	json.Unmarshal(b, &got)
+	if got["profile"].(map[string]any)["name"] != "me" {
+		t.Error("merge lost the unrelated profile setting")
+	}
+	wp := got["webkit"].(map[string]any)["webprefs"].(map[string]any)
+	if wp["other"].(float64) != 1 {
+		t.Error("merge lost a sibling webpref")
+	}
+	if wp["fonts"].(map[string]any)["fantasy"].(map[string]any)["Zyyy"] != "Impact" {
+		t.Errorf("merge did not override the font: %v", wp["fonts"])
+	}
+	if wp["fonts"].(map[string]any)["fixed"].(map[string]any)["Zyyy"] != "Consolas" {
+		t.Error("merge did not add the new font families")
 	}
 }

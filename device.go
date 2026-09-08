@@ -59,6 +59,12 @@ type deviceProfile struct {
 	// FontsConf, when set, is the fontconfig configuration Chrome runs
 	// with: the machine's fonts under the device's family names (fonts.go).
 	FontsConf func(installed map[string]bool) string
+	// FontFamilies are the default fonts Blink resolves the CSS generic
+	// families to (standard, serif, sansserif, fixed, cursive, fantasy),
+	// as the Windows names Chrome uses there — so their metrics, which
+	// fingerprinting scripts read off the generics, look like Windows and
+	// not the Linux fallbacks. Resolved to stand-ins by FontsConf.
+	FontFamilies map[string]string
 }
 
 // deviceProfiles is the registry, by name.
@@ -89,6 +95,20 @@ var deviceProfiles = map[string]*deviceProfile{
 		WebGLVendor:       "Google Inc. (NVIDIA)",
 		WebGLRenderer:     "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002504) Direct3D11 vs_5_0 ps_5_0, D3D11)",
 		FontsConf:         windowsFontsConf,
+		// The generic-family defaults Chrome ships on Windows. Blink
+		// resolves the CSS generics through these names, which FontsConf
+		// maps to stand-ins, so a script that measures `fantasy` (Impact,
+		// condensed) against `system-ui` (Segoe UI) reads Windows-shaped
+		// metrics rather than the Linux fallbacks that look like Firefox.
+		FontFamilies: map[string]string{
+			"standard":  "Times New Roman",
+			"serif":     "Times New Roman",
+			"sansserif": "Arial",
+			"fixed":     "Consolas",
+			"cursive":   "Comic Sans MS",
+			"fantasy":   "Impact",
+			"math":      "Cambria Math",
+		},
 	},
 }
 
@@ -197,12 +217,59 @@ func (d *deviceProfile) userAgentOverride(ver chromeVersion) *emulation.SetUserA
 	}
 }
 
+// clientHintHeaders are the low-entropy client-hint request headers the
+// profile stands for: Sec-CH-UA-Platform, Sec-CH-UA-Mobile and the Sec-CH-UA
+// brand list, lowercase name to value. The emulator stamps them onto every
+// request (emulate.go), because a tab's first navigation — a popup, or one
+// the owner opens in the live view — is requested by the browser before the
+// per-target user-agent override can reach it, and the command-line flag
+// sets only the user-agent string, not these. Only headers already on a
+// request are rewritten, never added, so a request carries exactly the hints
+// Chrome chose to send, with the platform corrected.
+func (d *deviceProfile) clientHintHeaders(ver chromeVersion) map[string]string {
+	if !d.emulated() {
+		return nil
+	}
+	var brands strings.Builder
+	for i, b := range brandVersions(ver.Major, ver.Full, false) {
+		if i > 0 {
+			brands.WriteString(", ")
+		}
+		fmt.Fprintf(&brands, "%q;v=%q", b.Brand, b.Version)
+	}
+	mobile := "?0"
+	if d.CHMobile {
+		mobile = "?1"
+	}
+	return map[string]string{
+		"sec-ch-ua-platform": fmt.Sprintf("%q", d.CHPlatform),
+		"sec-ch-ua-mobile":   mobile,
+		"sec-ch-ua":          brands.String(),
+	}
+}
+
+// fontPrefs is the Preferences fragment that sets Blink's generic-family
+// fonts (device.go's FontFamilies) for a profile, merged into the profile's
+// Default/Preferences before launch (session.go). nil for a profile that
+// sets none.
+func (d *deviceProfile) fontPrefs() map[string]any {
+	if len(d.FontFamilies) == 0 {
+		return nil
+	}
+	fonts := map[string]any{}
+	for generic, family := range d.FontFamilies {
+		// Zyyy is the "common" script; it is what a page with no :lang gets.
+		fonts[generic] = map[string]any{"Zyyy": family}
+	}
+	return map[string]any{"webkit": map[string]any{"webprefs": map[string]any{"fonts": fonts}}}
+}
+
 // chromeFlags are the command-line flags the profile adds. The user agent
 // goes on the command line as well as into every target's override: the
 // override reaches a target only once it exists, and a popup's first
 // navigation and a service worker's script fetch are requested before
-// that. The flag makes those say the right thing too (the client hints
-// on them stay Chrome's own; see README).
+// that. The flag makes the user-agent string right on those; the client
+// hints are corrected by the emulator's request stamping (clientHintHeaders).
 func (d *deviceProfile) chromeFlags(ver chromeVersion) []string {
 	if !d.emulated() {
 		return nil
@@ -315,6 +382,24 @@ const deviceInitScript = `(() => {
         return v;
       });
     }, 'getHighEntropyValues');
+  }
+  // window.outerWidth/outerHeight: a real desktop window's outer size is
+  // its inner size plus the browser frame. A tab reports 0 for a moment
+  // right after it opens (and a headless window always does), which reads
+  // as "no window" — a bot signal. Report the inner size plus a frame
+  // whenever the native value is 0, and pass it through otherwise.
+  if (typeof window !== 'undefined') {
+    const frame = {outerWidth: [0, 'innerWidth'], outerHeight: [74, 'innerHeight']};
+    for (const prop in frame) {
+      const [pad, inner] = frame[prop];
+      const d = Object.getOwnPropertyDescriptor(window, prop);
+      if (!d || !d.get) continue;
+      const nativeGet = d.get;
+      try {
+        Object.defineProperty(window, prop, {configurable: true, enumerable: d.enumerable,
+          get: mask(function () { const v = nativeGet.call(this); return v || (window[inner] + pad); }, 'get ' + prop)});
+      } catch (e) {}
+    }
   }
 })();`
 

@@ -160,9 +160,17 @@ How a profile is applied (`emulate.go`, `device.go`):
   be done per tab on adoption) and the screen size in both modes.
 - The user agent is also on the command line (`--user-agent`), because a
   popup's first navigation and a service worker's script fetch are requested
-  before any DevTools session can reach the new target. Those two requests
-  carry the profile's user agent but Chrome's own low-entropy client hints
-  (`Sec-CH-UA-Platform: "Linux"`); everything after them is consistent.
+  by the browser before any DevTools session can reach the new target — the
+  `waitForDebuggerOnStart` pause holds the renderer, not the browser-initiated
+  document request. The flag fixes the user-agent *string* on those, but not
+  the low-entropy client hints, so the same client also turns on **browser-level
+  request interception** (`Fetch.enable` on the browser session, which sees
+  those first requests) and rewrites `Sec-CH-UA-Platform` — and the brand and
+  mobile hints — to the profile's values on any request that still carries
+  Chrome's own. Only hints already present are rewritten, never added, so a
+  request sends exactly what Chrome chose to, with the platform corrected;
+  every request is continued whatever happens, and Chrome drops the
+  interception by itself if the client goes away, so a page never hangs on it.
 - A script evaluated in every new document (and in every worker before its
   own script) handles what the protocol cannot, or cannot reliably:
   `navigator.platform` (Blink keeps the protocol's override in per-page
@@ -171,9 +179,12 @@ How a profile is applied (`emulate.go`, `device.go`):
   survive the first navigation; and workers never get it), `navigator.webdriver`
   (true in any Chrome with remote debugging on; the flag that turns it off
   puts an "unsupported command-line flag" bar over headful windows),
-  the WebGL vendor and renderer strings, and `uaFullVersion`, which Chrome
-  blanks when the user agent comes from the command line. The patched
-  functions report `[native code]` to `Function.prototype.toString`.
+  the WebGL vendor and renderer strings, `uaFullVersion` (which Chrome blanks
+  when the user agent comes from the command line), and `window.outerWidth` /
+  `outerHeight` when they read 0 — which a freshly opened tab does for a moment
+  and a headless window always does, a "no window" bot signal — reported then
+  as the inner size plus a frame. The patched functions report `[native code]`
+  to `Function.prototype.toString`.
 - Headful sessions run with `--enable-unsafe-swiftshader`, since without a
   GPU headful Chrome otherwise has no WebGL at all (headless falls back to
   SwiftShader by itself), and a browser with no WebGL is nothing like a PC.
@@ -185,20 +196,32 @@ How a profile is applied (`emulate.go`, `device.go`):
   `outerHeight` exceed the inner ones the way a real window's do.
 - **Fonts** are the loudest thing after the user agent: a site lays text
   out in the first family of its stack that exists, and fingerprinting
-  scripts measure a list of families to see which do. The profile runs
-  Chrome with a fontconfig configuration of its own (`FONTCONFIG_FILE`;
-  `fonts.go`) that presents the image's fonts under Windows names — Segoe
-  UI is Selawik, Microsoft's own OFL-licensed metric-compatible stand-in;
-  Calibri and Cambria are Carlito and Caladea; Arial, Times New Roman and
-  Courier New are Liberation; Verdana, Tahoma and the rest of the common
-  ones are DejaVu; the East Asian families are Noto CJK; `system-ui` is
-  Segoe — and hides the image's own family names from explicit requests,
-  so `"DejaVu Sans"` in a stylesheet falls through the way it does on
-  Windows. Nothing is renamed; only which names find which fonts changes.
-  Chrome accepts a substitute only when the substituted request's first
-  family is the font found, so the file is generated against what `fc-list`
-  says is installed, and a deployment with fewer fonts simply has fewer
-  Windows families.
+  scripts measure a list of families to see which do — and, more subtly,
+  measure the CSS generic families (`system-ui`, `fantasy`, …) to tell one
+  OS and browser from another. The profile runs Chrome with a fontconfig
+  configuration of its own (`FONTCONFIG_FILE`; `fonts.go`) that presents the
+  image's fonts under Windows names — Segoe UI is Selawik, Microsoft's own
+  OFL-licensed metric-compatible stand-in; Calibri and Cambria are Carlito
+  and Caladea; Arial, Times New Roman and Courier New are Liberation; Verdana,
+  Tahoma and the rest of the common ones are DejaVu; Impact and the condensed
+  faces are Liberation Sans Narrow; the East Asian families are Noto CJK — and
+  hides the image's own family names from explicit requests, so `"DejaVu Sans"`
+  in a stylesheet falls through the way it does on Windows. Nothing is renamed;
+  only which names find which fonts changes. Chrome accepts a substitute only
+  when the substituted request's first family is the font found, so the file
+  is generated against what `fc-list` says is installed, and a deployment with
+  fewer fonts simply has fewer Windows families.
+- The **generic font families** — what `system-ui`, `serif`, `fantasy` and
+  the rest resolve to — Blink picks from its own preferences, not fontconfig,
+  so the profile also seeds the profile's `Default/Preferences` (merged, before
+  Chrome opens it) with the family names Chrome ships on Windows: `standard`
+  and `serif` Times New Roman, `sansserif` Arial, `fixed` Consolas, `cursive`
+  Comic Sans MS, `fantasy` Impact — resolved through the same Windows aliases
+  to stand-ins. Without this a script that measures `fantasy` (Impact, narrow
+  on Windows) against `system-ui` (Segoe UI) finds them the wrong way round —
+  the Linux fallbacks make `fantasy` the wider — and reads the box as Firefox
+  on Linux, contradicting the Chrome user agent and scoring the session as
+  "tampered". With it the metrics line up as Windows Chrome's do.
 
 What a profile does not change: `hardwareConcurrency` and `deviceMemory`
 (the container's own numbers, plausible for a PC and consistent across
@@ -322,7 +345,9 @@ identity save and seed, and the `-max-running` eviction — and
 `TestDeviceIntegration`: the `windows` profile with a timezone and locale
 against a server that records request headers and asks for the high-entropy
 client hints, checked on the page, in a worker, in a service worker, in a
-popup, after a park and resume, and (with an Xvnc on PATH) headful; and the
-default profile's brand list against the algorithm. They skip themselves
-where there is no Chrome, as in the image's build stage;
-`CHROMEMCP_TEST_NO_CHROME=1` skips them anywhere.
+popup (where the platform hint on the popup's own first navigation is checked,
+the request-interception path), after a park and resume, and (with an Xvnc on
+PATH) headful, including the framed outer-window size and that the `fantasy`
+generic measures narrower than `system-ui`; and the default profile's brand
+list against the algorithm. They skip themselves where there is no Chrome, as
+in the image's build stage; `CHROMEMCP_TEST_NO_CHROME=1` skips them anywhere.

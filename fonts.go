@@ -38,9 +38,13 @@ var (
 	// for Calibri and Cambria, Liberation Red Hat's for Arial, Times New
 	// Roman and Courier New; DejaVu is the Verdana/Tahoma lookalike, and
 	// Noto CJK covers the East Asian families.
-	segoe    = []string{"Selawik", "DejaVu Sans", "Liberation Sans"}
-	verdana  = []string{"DejaVu Sans", "Selawik", "Liberation Sans"}
-	arial    = []string{"Liberation Sans", "Arimo", "DejaVu Sans"}
+	segoe   = []string{"Selawik", "DejaVu Sans", "Liberation Sans"}
+	verdana = []string{"DejaVu Sans", "Selawik", "Liberation Sans"}
+	arial   = []string{"Liberation Sans", "Arimo", "DejaVu Sans"}
+	// Impact and Arial Narrow are condensed; the narrow stand-in keeps them
+	// visibly tighter than the body sans, which is also what makes the CSS
+	// `fantasy` generic (Blink resolves it to Impact) measure narrow.
+	narrow   = []string{"Liberation Sans Narrow", "Liberation Sans"}
 	times    = []string{"Liberation Serif", "Tinos", "DejaVu Serif"}
 	georgia  = []string{"DejaVu Serif", "Liberation Serif"}
 	courier  = []string{"Liberation Mono", "Cousine", "DejaVu Sans Mono"}
@@ -64,13 +68,13 @@ var windowsFonts = []fontAlias{
 	{"Segoe UI", segoe}, {"Segoe UI Light", segoe}, {"Segoe UI Semilight", segoe}, {"Segoe UI Semibold", segoe},
 	{"Segoe UI Black", segoe}, {"Segoe UI Variable", segoe}, {"Segoe UI Variable Text", segoe}, {"Segoe UI Symbol", verdana},
 	{"Segoe UI Emoji", emoji}, {"Segoe UI Historic", verdana}, {"Segoe Print", verdana}, {"Segoe Script", verdana},
-	{"Arial", arial}, {"Arial Black", arial}, {"Arial Narrow", []string{"Liberation Sans Narrow", "Liberation Sans"}},
+	{"Arial", arial}, {"Arial Black", arial}, {"Arial Narrow", narrow},
 	{"Helvetica", arial}, {"Microsoft Sans Serif", arial}, {"MS Sans Serif", arial}, {"MS Reference Sans Serif", arial},
 	{"Times New Roman", times}, {"Times", times}, {"Courier New", courier}, {"Courier", courier},
 	{"Tahoma", verdana}, {"Verdana", verdana}, {"Trebuchet MS", verdana}, {"Lucida Sans Unicode", verdana}, {"Lucida Sans", verdana},
 	{"Century Gothic", verdana}, {"Candara", verdana}, {"Corbel", verdana}, {"Franklin Gothic Medium", verdana}, {"Franklin Gothic", verdana},
 	{"Bahnschrift", verdana}, {"Ebrima", verdana}, {"Gadugi", verdana}, {"Leelawadee UI", verdana}, {"Nirmala UI", verdana},
-	{"Sylfaen", georgia}, {"Comic Sans MS", verdana}, {"Impact", arial}, {"Myanmar Text", verdana}, {"Javanese Text", verdana},
+	{"Sylfaen", georgia}, {"Comic Sans MS", verdana}, {"Impact", narrow}, {"Myanmar Text", verdana}, {"Javanese Text", verdana},
 	{"Calibri", calibri}, {"Calibri Light", calibri}, {"Cambria", cambria}, {"Cambria Math", cambria},
 	{"Georgia", georgia}, {"Constantia", georgia}, {"Palatino Linotype", georgia}, {"Book Antiqua", georgia},
 	{"Garamond", georgia}, {"Sitka", georgia}, {"Sitka Text", georgia}, {"Sitka Small", georgia}, {"Gabriola", georgia},

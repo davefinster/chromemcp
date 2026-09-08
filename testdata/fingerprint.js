@@ -66,6 +66,13 @@
                    'Courier New', 'Helvetica Neue', 'DejaVu Sans', 'Liberation Sans', 'Noto Sans', 'Roboto', 'Ubuntu']) {
     out.fonts[f] = generic.some((g, i) => measure('"' + f + '", ' + g) !== base[i]);
   }
+  // The CSS generic families' own metrics: scripts read these to tell one
+  // OS/browser from another (on Windows Chrome `fantasy` is Impact, narrower
+  // than the `system-ui` body font; the Linux fallbacks reverse that).
+  out.genericFonts = {};
+  for (const g of ['system-ui', 'fantasy', 'cursive', 'monospace', 'sans-serif', 'serif', '-apple-system']) {
+    out.genericFonts[g] = Math.round(measure(g));
+  }
   // The same from a worker, where a profile has to hold as well.
   out.worker = null;
   try {

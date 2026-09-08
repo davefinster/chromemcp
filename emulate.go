@@ -215,6 +215,12 @@ type emulationSpec struct {
 	// Script runs in every new document of every page and frame before the
 	// page's own scripts.
 	Script string
+	// CHHeaders, when set, are low-entropy client-hint request headers
+	// (lowercase name → value) stamped onto every request the browser makes,
+	// so a tab's first navigation — which the per-target override cannot
+	// reach — carries the profile's platform. Enables browser-level request
+	// interception.
+	CHHeaders map[string]string
 }
 
 // emulator applies an emulationSpec to every target of one Chrome.
@@ -261,6 +267,18 @@ func startEmulator(ctx context.Context, wsURL string, spec *emulationSpec, logf 
 	if err := e.setAutoAttach(ctx, ""); err != nil {
 		conn.close()
 		return nil, err
+	}
+	// Browser-level request interception, to stamp the low-entropy client
+	// hints onto requests the per-target override cannot reach — a new tab's
+	// or popup's first navigation, which the browser dispatches before the
+	// target exists. Enabled on the browser session, it sees those.
+	if len(spec.CHHeaders) > 0 {
+		if err := e.conn.call(ctx, "", "Fetch.enable", map[string]any{
+			"patterns": []map[string]any{{"urlPattern": "*", "requestStage": "Request"}},
+		}, nil); err != nil {
+			conn.close()
+			return nil, fmt.Errorf("emulation: enabling request interception: %w", err)
+		}
 	}
 	conn.mu.Lock()
 	conn.queue = append(conn.queue, &cdproto.Message{ID: -1})
@@ -319,25 +337,72 @@ func (e *emulator) setAutoAttach(ctx context.Context, session target.SessionID) 
 }
 
 func (e *emulator) handle(m *cdproto.Message) {
-	if m.Method != cdproto.EventTargetAttachedToTarget {
+	switch m.Method {
+	case cdproto.EventTargetAttachedToTarget:
+		var ev target.EventAttachedToTarget
+		if json.Unmarshal(m.Params, &ev) != nil || ev.TargetInfo == nil {
+			return
+		}
+		done := make(chan struct{})
+		e.mu.Lock()
+		if e.initial != nil {
+			e.initial = append(e.initial, done)
+		}
+		e.mu.Unlock()
+		// Each target on its own goroutine: a target that never answers (an
+		// extension's idle service worker) must not hold up the rest.
+		go func() {
+			defer close(done)
+			e.apply(ev.SessionID, ev.TargetInfo, ev.WaitingForDebugger)
+		}()
+	case "Fetch.requestPaused":
+		var ev struct {
+			RequestID string `json:"requestId"`
+			Request   struct {
+				Headers map[string]string `json:"headers"`
+			} `json:"request"`
+		}
+		if json.Unmarshal(m.Params, &ev) != nil {
+			return
+		}
+		// A paused request must always be released, or the page hangs; do it
+		// off the event loop so interception never blocks target attachment.
+		go e.stamp(m.SessionID, ev.RequestID, ev.Request.Headers)
+	}
+}
+
+// stamp rewrites the client-hint headers already present on a paused request
+// to the profile's values and continues it. The request is continued
+// whatever happens; a header only Chrome added but the profile does not
+// change is left as it is.
+func (e *emulator) stamp(sid target.SessionID, requestID string, headers map[string]string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	changed := false
+	var list []map[string]string
+	for name, value := range headers {
+		if want, ok := e.spec.CHHeaders[strings.ToLower(name)]; ok && value != want {
+			value = want
+			changed = true
+		}
+		list = append(list, map[string]string{"name": name, "value": value})
+	}
+	args := map[string]any{"requestId": requestID}
+	if changed {
+		args["headers"] = list
+	}
+	err := <-e.conn.send(ctx, sid, "Fetch.continueRequest", args)
+	if err == nil || e.logf == nil {
 		return
 	}
-	var ev target.EventAttachedToTarget
-	if json.Unmarshal(m.Params, &ev) != nil || ev.TargetInfo == nil {
-		return
-	}
-	done := make(chan struct{})
+	// Parking closes the connection with requests still paused; those
+	// failures are expected and Chrome drops interception on its own.
 	e.mu.Lock()
-	if e.initial != nil {
-		e.initial = append(e.initial, done)
-	}
+	closing := e.closing
 	e.mu.Unlock()
-	// Each target on its own goroutine: a target that never answers (an
-	// extension's idle service worker) must not hold up the rest.
-	go func() {
-		defer close(done)
-		e.apply(ev.SessionID, ev.TargetInfo, ev.WaitingForDebugger)
-	}()
+	if !closing {
+		e.logf("emulation: continuing request: %v", err)
+	}
 }
 
 // internalTarget is one of Chrome's own: a component extension, a chrome://

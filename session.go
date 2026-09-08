@@ -493,6 +493,55 @@ func (m *manager) shutdown() {
 func (s *session) profileDir() string   { return filepath.Join(s.dir, "profile") }
 func (s *session) downloadsDir() string { return filepath.Join(s.dir, "downloads") }
 
+// mergeProfilePrefs deep-merges prefs into the profile's Default/Preferences
+// JSON (Chrome's per-profile settings), creating it if need be. Chrome
+// rewrites this file on a clean exit, keeping what it does not manage, so a
+// merge each launch is idempotent and survives park/resume and an identity's
+// own settings. The font families here are plain (unprotected) preferences,
+// not the HMAC-guarded "Secure Preferences", so writing them is safe.
+func mergeProfilePrefs(profileDir string, prefs map[string]any) error {
+	if len(prefs) == 0 {
+		return nil
+	}
+	dir := filepath.Join(profileDir, "Default")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "Preferences")
+	current := map[string]any{}
+	if b, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(b, &current); err != nil {
+			// A corrupt Preferences file: Chrome would reset it anyway.
+			current = map[string]any{}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	deepMerge(current, prefs)
+	b, err := json.Marshal(current)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path+".tmp", b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(path+".tmp", path)
+}
+
+// deepMerge recursively merges src into dst: nested objects are merged, and
+// a leaf in src replaces the one in dst.
+func deepMerge(dst, src map[string]any) {
+	for k, sv := range src {
+		if sm, ok := sv.(map[string]any); ok {
+			if dm, ok := dst[k].(map[string]any); ok {
+				deepMerge(dm, sm)
+				continue
+			}
+		}
+		dst[k] = sv
+	}
+}
+
 func (s *session) saveMeta() error {
 	s.meta.LastUsed = time.Unix(0, s.lastUsed.Load())
 	b, err := json.MarshalIndent(&s.meta, "", "  ")
@@ -565,6 +614,12 @@ func (s *session) launch(ctx context.Context) error {
 	} else if fc != "" {
 		l.Env = append(l.Env, "FONTCONFIG_FILE="+fc)
 	}
+	// The generic-family font defaults go into the profile's Preferences,
+	// where Blink reads them, before Chrome opens it. Merged, so an
+	// identity's own settings and a resumed profile's survive.
+	if err := mergeProfilePrefs(s.profileDir(), dev.fontPrefs()); err != nil {
+		logf("session %s: font preferences: %v", s.meta.ID, err)
+	}
 	if s.meta.Locale != "" {
 		flags, env := localeLaunch(s.meta.Locale)
 		l.ExtraFlags = append(l.ExtraFlags, flags...)
@@ -592,6 +647,7 @@ func (s *session) launch(ctx context.Context) error {
 		UserAgent: dev.userAgentOverride(ver),
 		Metrics:   dev.metrics(w, h, s.meta.Mode == modeHeadless),
 		Script:    dev.initScript(ver),
+		CHHeaders: dev.clientHintHeaders(ver),
 	}, logf)
 	if err != nil {
 		proc.stop(2 * time.Second)
