@@ -34,6 +34,7 @@ type chromeLaunch struct {
 	Height      int
 	NoSandbox   bool
 	ExtraFlags  []string
+	Env         []string // extra environment, "K=V"
 	Verbose     bool
 	Logf        func(string, ...any)
 }
@@ -77,6 +78,12 @@ func (l *chromeLaunch) flags() []string {
 	}
 	if l.Headless {
 		args = append(args, "--headless=new", "--disable-gpu")
+	} else {
+		// Without a GPU, headful Chrome has no WebGL at all unless it is
+		// allowed to fall back to SwiftShader — which headless does by
+		// itself. A browser with no WebGL breaks maps and charts, and is
+		// nothing like the PC a device profile describes.
+		args = append(args, "--enable-unsafe-swiftshader")
 	}
 	if l.NoSandbox {
 		args = append(args, "--no-sandbox", "--disable-setuid-sandbox")
@@ -102,6 +109,7 @@ func launchChrome(ctx context.Context, l *chromeLaunch) (*chromeProc, error) {
 
 	cmd := exec.Command(l.Exe, l.flags()...)
 	cmd.Env = append(os.Environ(), "HOME="+l.UserDataDir)
+	cmd.Env = append(cmd.Env, l.Env...)
 	if l.Headless {
 		cmd.Env = append(cmd.Env, "DISPLAY=")
 	} else {

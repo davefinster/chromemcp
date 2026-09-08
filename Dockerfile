@@ -21,11 +21,19 @@ RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/chrom
 # ---- runtime ---------------------------------------------------------------
 # Debian: Google Chrome from Google's own apt repository (which serves amd64
 # and arm64 alike), TigerVNC's Xvnc for the headful display, noVNC for the
-# live view, and Node for chrome-devtools-mcp.
+# live view, Node for chrome-devtools-mcp, and the fonts the device profiles
+# present under Windows names (fonts.go): Liberation for Arial / Times New
+# Roman / Courier New, Carlito and Caladea for Calibri and Cambria, DejaVu
+# for Verdana and Tahoma, Noto CJK for the East Asian families, and Selawik
+# — Microsoft's own OFL-licensed metric-compatible stand-in for Segoe UI,
+# which no distribution packages — from its release on GitHub. fontconfig's
+# fc-list is how the server learns which of them are there.
 FROM debian:trixie-slim
 ARG DEVTOOLS_MCP_VERSION=1.8.0
+ARG SELAWIK_URL=https://github.com/microsoft/Selawik/releases/download/1.01/Selawik_Release.zip
+ARG SELAWIK_SHA256=3f62c51e05e3b5a1e6241cf92a371f0be2ea1183aa87b30718bbd40832a8d423
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg unzip \
  && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
  && printf 'Types: deb\nURIs: https://dl.google.com/linux/chrome/deb/\nSuites: stable\nComponents: main\nArchitectures: amd64 arm64\nSigned-By: /usr/share/keyrings/google-chrome.gpg\n' > /etc/apt/sources.list.d/google-chrome.sources \
  && apt-get update \
@@ -33,11 +41,18 @@ RUN apt-get update \
       google-chrome-stable \
       tigervnc-standalone-server novnc \
       nodejs npm \
-      fonts-liberation fonts-noto-core fonts-noto-color-emoji fonts-noto-cjk \
+      fontconfig fonts-liberation fonts-dejavu-core fonts-crosextra-carlito fonts-crosextra-caladea \
+      fonts-noto-core fonts-noto-color-emoji fonts-noto-cjk \
       tzdata procps \
+ && curl -fsSL -o /tmp/selawik.zip "${SELAWIK_URL}" \
+ && echo "${SELAWIK_SHA256}  /tmp/selawik.zip" | sha256sum -c - \
+ && install -d /usr/local/share/fonts/selawik \
+ && unzip -j -q /tmp/selawik.zip '*.ttf' -d /usr/local/share/fonts/selawik \
+ && rm /tmp/selawik.zip \
+ && fc-cache -f \
  && npm install -g --omit=dev "chrome-devtools-mcp@${DEVTOOLS_MCP_VERSION}" \
  && npm cache clean --force \
- && apt-get purge -y npm gnupg && apt-get autoremove -y \
+ && apt-get purge -y npm gnupg unzip && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/* /root/.npm \
  && useradd --uid 1000 --user-group --home-dir /data --no-create-home --shell /usr/sbin/nologin chrome \
  && install -d -o chrome -g chrome -m 0755 /data /data/identities

@@ -14,12 +14,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	_ "time/tzdata" // so a timezone can be checked where the image has no zoneinfo
 
 	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/cdproto/cdp"
@@ -36,8 +38,14 @@ const (
 
 // headfulChromeHeight is the room Chrome's own UI (tab strip, toolbar)
 // takes above the page in a headful window, so the display is made that
-// much taller than the requested viewport.
-const headfulChromeHeight = 88
+// much taller than the requested viewport. windowFrameWidth is the width
+// of a desktop window's side borders; an emulated device's headless window
+// is made that much bigger than its viewport, so window.outerWidth and
+// outerHeight exceed the inner ones the way a real window's do.
+const (
+	headfulChromeHeight = 88
+	windowFrameWidth    = 16
+)
 
 type managerConfig struct {
 	SessionsDir   string
@@ -68,6 +76,9 @@ type sessionMeta struct {
 	LastUsed  time.Time `json:"last_used"`
 	Width     int       `json:"width"`
 	Height    int       `json:"height"`
+	Device    string    `json:"device,omitempty"`   // device profile (device.go); "" is default
+	Timezone  string    `json:"timezone,omitempty"` // IANA zone Chrome runs in; "" is the server's
+	Locale    string    `json:"locale,omitempty"`   // Chrome's --lang; "" is the server's
 	LastURL   string    `json:"last_url,omitempty"`
 	LastTitle string    `json:"last_title,omitempty"`
 	Tabs      []string  `json:"tabs,omitempty"` // URLs open when parked, reopened on resume
@@ -84,6 +95,7 @@ type session struct {
 
 	chrome     *chromeProc
 	disp       *display
+	emu        *emulator
 	allocCtx   context.Context
 	allocStop  context.CancelFunc
 	browserCtx context.Context
@@ -144,6 +156,39 @@ type manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
+
+	verMu       sync.Mutex
+	ver         *chromeVersion  // the binary's version, probed on first need
+	fonts       map[string]bool // the machine's font families, listed on first need
+	fontsListed bool
+}
+
+// installedFonts is the machine's font families, listed once.
+func (m *manager) installedFonts() map[string]bool {
+	m.verMu.Lock()
+	defer m.verMu.Unlock()
+	if !m.fontsListed {
+		m.fonts = installedFonts()
+		m.fontsListed = true
+		if m.fonts == nil {
+			logf("fc-list unavailable: device profiles assume every substitute font is installed")
+		}
+	}
+	return m.fonts
+}
+
+// chromeVersion is the Chrome binary's version, probed once.
+func (m *manager) chromeVersion() (chromeVersion, error) {
+	m.verMu.Lock()
+	defer m.verMu.Unlock()
+	if m.ver == nil {
+		v, err := probeChromeVersion(m.cfg.Chrome, m.cfg.NoSandbox)
+		if err != nil {
+			return chromeVersion{}, err
+		}
+		m.ver = &v
+	}
+	return *m.ver, nil
 }
 
 func newManager(cfg *managerConfig) (*manager, error) {
@@ -199,7 +244,12 @@ type startOptions struct {
 	Label    string
 	Width    int
 	Height   int
+	Device   string
+	Timezone string
+	Locale   string
 }
+
+var localeRe = regexp.MustCompile(`^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`)
 
 // start creates a session — a Chrome on a fresh profile, or on a copy of an
 // identity's — and launches it.
@@ -225,6 +275,21 @@ func (m *manager) start(ctx context.Context, o startOptions) (*session, error) {
 			return nil, err
 		}
 	}
+	dev, err := lookupDevice(o.Device)
+	if err != nil {
+		return nil, err
+	}
+	if dev.Name == "default" {
+		o.Device = ""
+	}
+	if o.Timezone != "" {
+		if _, err := time.LoadLocation(o.Timezone); err != nil {
+			return nil, fmt.Errorf("timezone %q: want an IANA zone such as Europe/London or Australia/Sydney", o.Timezone)
+		}
+	}
+	if o.Locale != "" && !localeRe.MatchString(o.Locale) {
+		return nil, fmt.Errorf("locale %q: want a language tag such as en-US or de-DE", o.Locale)
+	}
 
 	id := newSessionID()
 	dir := filepath.Join(m.cfg.SessionsDir, id)
@@ -235,6 +300,7 @@ func (m *manager) start(ctx context.Context, o startOptions) (*session, error) {
 	s := &session{mgr: m, dir: dir, meta: sessionMeta{
 		ID: id, Label: o.Label, Mode: o.Mode, Identity: o.Identity,
 		Created: now, LastUsed: now, Width: o.Width, Height: o.Height,
+		Device: o.Device, Timezone: o.Timezone, Locale: o.Locale,
 	}}
 	s.lastUsed.Store(now.UnixNano())
 	if o.Identity != "" {
@@ -258,7 +324,7 @@ func (m *manager) start(ctx context.Context, o startOptions) (*session, error) {
 	m.mu.Lock()
 	m.sessions[id] = s
 	m.mu.Unlock()
-	logf("session %s: started (%s%s)", id, o.Mode, identitySuffix(o.Identity))
+	logf("session %s: started (%s%s%s)", id, o.Mode, identitySuffix(o.Identity), s.meta.deviceSuffix())
 	return s, nil
 }
 
@@ -267,6 +333,25 @@ func identitySuffix(identity string) string {
 		return ""
 	}
 	return ", identity " + identity
+}
+
+// deviceSuffix describes the emulation for listings: ", device windows,
+// timezone Europe/London".
+func (m *sessionMeta) deviceSuffix() string {
+	var parts []string
+	if m.Device != "" {
+		parts = append(parts, "device "+m.Device)
+	}
+	if m.Timezone != "" {
+		parts = append(parts, "timezone "+m.Timezone)
+	}
+	if m.Locale != "" {
+		parts = append(parts, "locale "+m.Locale)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return ", " + strings.Join(parts, ", ")
 }
 
 // get finds a session by id; running or parked.
@@ -445,6 +530,16 @@ func (s *session) launch(ctx context.Context) error {
 	}
 	cfg := s.mgr.cfg
 	w, h := s.meta.Width, s.meta.Height
+	dev, err := lookupDevice(s.meta.Device)
+	if err != nil {
+		return err
+	}
+	var ver chromeVersion
+	if dev.emulated() {
+		if ver, err = s.mgr.chromeVersion(); err != nil {
+			return fmt.Errorf("device %s: %w", dev.Name, err)
+		}
+	}
 	var disp *display
 	if s.meta.Mode == modeHeadful {
 		var err error
@@ -461,13 +556,28 @@ func (s *session) launch(ctx context.Context) error {
 		Width:       w,
 		Height:      h,
 		NoSandbox:   cfg.NoSandbox,
-		ExtraFlags:  cfg.ChromeFlags,
+		ExtraFlags:  append(append([]string(nil), cfg.ChromeFlags...), dev.chromeFlags(ver)...),
 		Verbose:     cfg.Verbose,
 		Logf:        logf,
+	}
+	if fc, err := dev.fontsConfFile(cfg.SessionsDir, s.mgr.installedFonts()); err != nil {
+		logf("session %s: fonts configuration: %v", s.meta.ID, err)
+	} else if fc != "" {
+		l.Env = append(l.Env, "FONTCONFIG_FILE="+fc)
+	}
+	if s.meta.Locale != "" {
+		flags, env := localeLaunch(s.meta.Locale)
+		l.ExtraFlags = append(l.ExtraFlags, flags...)
+		l.Env = append(l.Env, env...)
+	}
+	if s.meta.Timezone != "" {
+		l.Env = append(l.Env, "TZ="+s.meta.Timezone)
 	}
 	if disp != nil {
 		l.Display = disp.Display()
 		l.Height = h + headfulChromeHeight
+	} else if dev.emulated() {
+		l.Width, l.Height = w+windowFrameWidth, h+headfulChromeHeight
 	}
 	proc, err := launchChrome(ctx, l)
 	if err != nil {
@@ -475,6 +585,20 @@ func (s *session) launch(ctx context.Context) error {
 			disp.stop()
 		}
 		return err
+	}
+	// The device profile goes on before anything connects, so the first
+	// tab carries it from its first request.
+	emu, err := startEmulator(ctx, proc.WSURL, &emulationSpec{
+		UserAgent: dev.userAgentOverride(ver),
+		Metrics:   dev.metrics(w, h, s.meta.Mode == modeHeadless),
+		Script:    dev.initScript(ver),
+	}, logf)
+	if err != nil {
+		proc.stop(2 * time.Second)
+		if disp != nil {
+			disp.stop()
+		}
+		return fmt.Errorf("device emulation: %w", err)
 	}
 
 	allocCtx, allocStop := chromedp.NewRemoteAllocator(context.Background(), proc.WSURL, chromedp.NoModifyURL)
@@ -487,7 +611,7 @@ func (s *session) launch(ctx context.Context) error {
 	}
 	browserCtx, _ := chromedp.NewContext(allocCtx, opts...)
 
-	s.chrome, s.disp = proc, disp
+	s.chrome, s.disp, s.emu = proc, disp, emu
 	s.allocCtx, s.allocStop, s.browserCtx = allocCtx, allocStop, browserCtx
 	s.tabs = map[target.ID]*tab{}
 	s.closing = map[target.ID]time.Time{}
@@ -589,13 +713,16 @@ func (s *session) park() {
 		// are consistent for a resume or an identity snapshot.
 		s.chrome.stop(5 * time.Second)
 	}
+	if s.emu != nil {
+		s.emu.close()
+	}
 	if s.allocStop != nil {
 		s.allocStop()
 	}
 	if s.disp != nil {
 		s.disp.stop()
 	}
-	s.chrome, s.disp, s.allocCtx, s.allocStop, s.browserCtx = nil, nil, nil, nil, nil
+	s.chrome, s.disp, s.emu, s.allocCtx, s.allocStop, s.browserCtx = nil, nil, nil, nil, nil, nil
 	s.tabs, s.closing, s.aliases, s.current, s.front = nil, nil, nil, "", ""
 	if err := s.saveMeta(); err != nil {
 		logf("session %s: saving metadata: %v", s.meta.ID, err)
@@ -680,15 +807,9 @@ func (s *session) adopt(ctx context.Context, id target.ID) error {
 		cancel()
 		return err
 	}
-	if s.meta.Mode == modeHeadless {
-		// Headless Chrome's window size includes a virtual toolbar; the
-		// page gets exactly the requested viewport by emulation instead.
-		ectx, ecancel := context.WithTimeout(tctx, 5*time.Second)
-		if err := chromedp.Run(ectx, chromedp.EmulateViewport(int64(s.meta.Width), int64(s.meta.Height))); err != nil {
-			logf("session %s: viewport: %v", s.meta.ID, err)
-		}
-		ecancel()
-	}
+	// The viewport (headless Chrome's window size includes a virtual
+	// toolbar) and the device profile were put on the target by the
+	// emulator when Chrome created it, before it ran anything.
 	s.nextTab++
 	t := &tab{id: id, seq: s.nextTab, alias: fmt.Sprintf("t%d", s.nextTab), ctx: tctx, cancel: cancel}
 	s.tabs[id] = t
@@ -723,10 +844,12 @@ func (s *session) adopt(ctx context.Context, id target.ID) error {
 	return nil
 }
 
-// newTab opens a page and makes it current. Caller holds s.mu.
+// newTab opens a page and makes it current. Caller holds s.mu. The tab
+// is created blank and then navigated: a target created at a URL has its
+// first request on the way before the emulator can reach it.
 func (s *session) newTab(ctx context.Context, url string) (*tab, error) {
 	c := chromedp.FromContext(s.browserCtx)
-	id, err := target.CreateTarget(url).Do(cdp.WithExecutor(ctx, c.Browser))
+	id, err := target.CreateTarget("about:blank").Do(cdp.WithExecutor(ctx, c.Browser))
 	if err != nil {
 		return nil, fmt.Errorf("opening tab: %w", err)
 	}
@@ -734,7 +857,13 @@ func (s *session) newTab(ctx context.Context, url string) (*tab, error) {
 		return nil, err
 	}
 	s.current = id
-	return s.tabs[id], nil
+	t := s.tabs[id]
+	if url != "" && url != "about:blank" {
+		if err := navigate(ctx, t, url, 30*time.Second); err != nil {
+			return t, err
+		}
+	}
+	return t, nil
 }
 
 // resolveTab finds a tab by alias or target id; "" is the current tab.

@@ -330,15 +330,15 @@ func TestToolRegistry(t *testing.T) {
 		"identity_list", "identity_save", "identity_delete",
 		"browser_navigate", "browser_history", "browser_snapshot", "browser_screenshot", "browser_click", "browser_type",
 		"browser_press", "browser_hover", "browser_scroll", "browser_select", "browser_wait", "browser_read",
-		"browser_evaluate", "browser_console", "browser_tabs", "browser_tab_new", "browser_tab_select", "browser_tab_close",
+		"browser_evaluate", "browser_fingerprint", "browser_console", "browser_tabs", "browser_tab_new", "browser_tab_select", "browser_tab_close",
 		"devtools_tools", "devtools_call",
 	} {
 		if !names[want] {
 			t.Errorf("tool %s not registered", want)
 		}
 	}
-	if len(res.Tools) != 29 {
-		t.Errorf("%d tools, want 29", len(res.Tools))
+	if len(res.Tools) != 30 {
+		t.Errorf("%d tools, want 30", len(res.Tools))
 	}
 	// An unknown session is a tool error, not a transport error.
 	r, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "browser_navigate", Arguments: map[string]any{"session_id": "s-00000000", "url": "https://x.test"}})

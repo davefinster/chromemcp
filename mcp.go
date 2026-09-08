@@ -41,7 +41,12 @@ screenshot=false when you only need the text. browser_read gives the page's text
 cheaply; browser_screenshot with labels=true overlays the refs on the picture.
 
 devtools_tools / devtools_call pass a session through to Google's chrome-devtools-mcp
-(network requests, performance traces, emulation, and more) on the same Chrome.`
+(network requests, performance traces, emulation, and more) on the same Chrome.
+
+DEVICE PROFILES: session_start device="windows" makes the session look like a Windows
+11 PC running Chrome to the sites it visits — user agent, client hints, navigator.platform,
+screen, GPU — for testing how a site behaves for such a user; the default is this
+server's own Chrome (Linux). timezone and locale are set per session the same way.`
 
 type mcpApp struct {
 	mgr   *manager
@@ -165,6 +170,9 @@ type sessionStartIn struct {
 	Identity string `json:"identity,omitempty" jsonschema:"start on a copy of this saved identity's profile, i.e. already logged in as that user (identity_list)"`
 	Label    string `json:"label,omitempty" jsonschema:"a short note on what the session is for, shown by session_list"`
 	Viewport string `json:"viewport,omitempty" jsonschema:"page size WxH, e.g. 1280x800 (the server default) or 390x844 for a phone-sized page"`
+	Device   string `json:"device,omitempty" jsonschema:"device profile the browser presents to sites: default (this server's own Chrome, Linux) or windows (a Windows 11 PC running Chrome: Windows user agent and client hints, navigator.platform Win32, 1920x1080 screen, NVIDIA GPU strings)"`
+	Timezone string `json:"timezone,omitempty" jsonschema:"IANA time zone the browser runs in, e.g. Europe/London or Australia/Sydney (default: the server's, UTC in the container)"`
+	Locale   string `json:"locale,omitempty" jsonschema:"browser language as a tag, e.g. en-US, en-GB, de-DE: sets Accept-Language, navigator.language and the Intl defaults (default: the server's, en-US)"`
 	URL      string `json:"url,omitempty" jsonschema:"open this URL right away"`
 }
 
@@ -315,7 +323,8 @@ func (a *mcpApp) register(s *mcp.Server) {
 		Name: "session_start",
 		Description: "Start a new Chrome: a fresh profile (nothing logged in, no history), or a copy of a saved identity's profile " +
 			"(already logged in as that user). Returns the session_id every other tool needs. Headless by default; " +
-			"mode=headful for a browser a person can watch and drive (session_view), or for sites that block headless Chrome.",
+			"mode=headful for a browser a person can watch and drive (session_view), or for sites that block headless Chrome. " +
+			"device=windows presents the session to sites as a Windows 11 PC running Chrome; timezone and locale set where and in what language it runs.",
 		Annotations: acts("Start a browser session"),
 	}, a.sessionStart)
 	mcp.AddTool(s, &mcp.Tool{
@@ -437,6 +446,13 @@ func (a *mcpApp) register(s *mcp.Server) {
 		Annotations: acts("Run JavaScript"),
 	}, a.evaluate)
 	mcp.AddTool(s, &mcp.Tool{
+		Name: "browser_fingerprint",
+		Description: "What the page's scripts see of the device: user agent and client hints, navigator.platform, languages, time zone, " +
+			"screen and window, GPU strings, which fonts are installed, and the same from a worker. For checking what a device profile, " +
+			"timezone or locale presents to a site.",
+		Annotations: readOnly("Device fingerprint"),
+	}, a.fingerprint)
+	mcp.AddTool(s, &mcp.Tool{
 		Name:        "browser_console",
 		Description: "Console messages and uncaught exceptions the tab has logged since the session started (or since the last clear).",
 		Annotations: readOnly("Console log"),
@@ -482,7 +498,7 @@ func (a *mcpApp) register(s *mcp.Server) {
 // ---- session tools ----
 
 func (a *mcpApp) sessionStart(ctx context.Context, req *mcp.CallToolRequest, in sessionStartIn) (*mcp.CallToolResult, any, error) {
-	o := startOptions{Mode: in.Mode, Identity: in.Identity, Label: in.Label}
+	o := startOptions{Mode: in.Mode, Identity: in.Identity, Label: in.Label, Device: in.Device, Timezone: in.Timezone, Locale: in.Locale}
 	if in.Viewport != "" {
 		w, h, err := parseViewport(in.Viewport)
 		if err != nil {
@@ -495,7 +511,12 @@ func (a *mcpApp) sessionStart(ctx context.Context, req *mcp.CallToolRequest, in 
 		return nil, nil, err
 	}
 	r := &result{}
-	r.addf("started session %s (%s, %dx%d%s)", s.meta.ID, s.meta.Mode, s.meta.Width, s.meta.Height, identitySuffix(s.meta.Identity))
+	r.addf("started session %s (%s, %dx%d%s%s)", s.meta.ID, s.meta.Mode, s.meta.Width, s.meta.Height, identitySuffix(s.meta.Identity), s.meta.deviceSuffix())
+	if s.meta.Device != "" {
+		if d, err := lookupDevice(s.meta.Device); err == nil {
+			r.addf("sites see %s.", d.Description)
+		}
+	}
 	if s.meta.Mode == modeHeadful {
 		r.addf("session_view gives a person a live view of this browser.")
 	}
@@ -537,6 +558,7 @@ func (a *mcpApp) sessionList(ctx context.Context, req *mcp.CallToolRequest, in s
 			if s.meta.Identity != "" {
 				fmt.Fprintf(&sb, ", identity %s", s.meta.Identity)
 			}
+			sb.WriteString(s.meta.deviceSuffix())
 			if s.meta.Label != "" {
 				fmt.Fprintf(&sb, ", %q", s.meta.Label)
 			}
@@ -561,7 +583,8 @@ func (a *mcpApp) sessionList(ctx context.Context, req *mcp.CallToolRequest, in s
 		sb.WriteString("\n")
 	}
 	cfg := a.mgr.cfg
-	fmt.Fprintf(&sb, "\nidle sessions are parked after %s and deleted after %s unused; headful: %v", cfg.IdlePark, cfg.MaxAge, cfg.Xvnc != "")
+	fmt.Fprintf(&sb, "\nidle sessions are parked after %s and deleted after %s unused; headful: %v; device profiles: %s",
+		cfg.IdlePark, cfg.MaxAge, cfg.Xvnc != "", strings.Join(deviceNames(), ", "))
 	return text(sb.String()), nil, nil
 }
 
@@ -1150,6 +1173,26 @@ func (a *mcpApp) evaluate(ctx context.Context, req *mcp.CallToolRequest, in eval
 			if img, mime, err := screenshot(ctx, t, screenshotOpts{}); err == nil {
 				r.image, r.mime = img, mime
 			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return r.toolResult(), nil, nil
+}
+
+func (a *mcpApp) fingerprint(ctx context.Context, req *mcp.CallToolRequest, in tabIn) (*mcp.CallToolResult, any, error) {
+	r := &result{}
+	err := a.mgr.withTab(ctx, in.SessionID, in.Tab, func(ctx context.Context, s *session, t *tab) error {
+		out, err := evaluate(ctx, t, fingerprintScript, 20*time.Second)
+		if err != nil {
+			return err
+		}
+		r.addf("session %s%s", s.meta.ID, s.meta.deviceSuffix())
+		r.lines = append(r.lines, out)
+		if strings.Contains(out, `"userAgentData": null`) {
+			r.addf("note: navigator.userAgentData (the client hints) is only exposed on https pages; navigate to one to see it")
 		}
 		return nil
 	})
