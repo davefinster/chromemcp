@@ -167,10 +167,16 @@ How a profile is applied (`emulate.go`, `device.go`):
   request interception** (`Fetch.enable` on the browser session, which sees
   those first requests) and rewrites `Sec-CH-UA-Platform` — and the brand and
   mobile hints — to the profile's values on any request that still carries
-  Chrome's own. Only hints already present are rewritten, never added, so a
-  request sends exactly what Chrome chose to, with the platform corrected;
-  every request is continued whatever happens, and Chrome drops the
-  interception by itself if the client goes away, so a page never hangs on it.
+  Chrome's own. It also caps `Sec-CH-Device-Memory` / `Device-Memory` (the
+  hint that carries device memory over the wire, which no override touches, so
+  the container's host figure — 16 or 32 — leaks into it; a real browser caps
+  the hint at 8, making anything larger an impossible value that anti-bots read
+  as a VM, and Akamai on mouser.com answers a request bearing it with an HTTP/2
+  stream reset the browser shows as `ERR_HTTP2_PROTOCOL_ERROR`). Only hints
+  already present are rewritten, never added, so a request sends exactly what
+  Chrome chose to, with the machine values corrected; every request is continued
+  whatever happens, and Chrome drops the interception by itself if the client
+  goes away, so a page never hangs on it.
 - A script evaluated in every new document (and in every worker before its
   own script) handles what the protocol cannot, or cannot reliably:
   `navigator.platform` (Blink keeps the protocol's override in per-page
@@ -180,11 +186,19 @@ How a profile is applied (`emulate.go`, `device.go`):
   (true in any Chrome with remote debugging on; the flag that turns it off
   puts an "unsupported command-line flag" bar over headful windows),
   the WebGL vendor and renderer strings, `uaFullVersion` (which Chrome blanks
-  when the user agent comes from the command line), and `window.outerWidth` /
+  when the user agent comes from the command line), `window.outerWidth` /
   `outerHeight` when they read 0 — which a freshly opened tab does for a moment
   and a headless window always does, a "no window" bot signal — reported then
-  as the inner size plus a frame. The patched functions report `[native code]`
-  to `Function.prototype.toString`.
+  as the inner size plus a frame, and the machine numbers a container reports
+  from its host rather than a consumer PC: `navigator.deviceMemory` (the
+  container sees 16 or 32 GB, but a real browser caps this at 8, so anything
+  higher is impossible and marks a VM) is pinned to 8 — matching the
+  `Sec-CH-Device-Memory` header the request interception caps to the same value
+  — `navigator.hardwareConcurrency` (a server's core count) to 8, and
+  `screen.availHeight` reserves a 48px taskbar (emulated device metrics
+  otherwise leave it equal to the screen height — no desktop chrome), page and
+  workers alike. The patched functions report `[native code]` to
+  `Function.prototype.toString`.
 - Headful sessions run with `--enable-unsafe-swiftshader`, since without a
   GPU headful Chrome otherwise has no WebGL at all (headless falls back to
   SwiftShader by itself), and a browser with no WebGL is nothing like a PC.
@@ -223,14 +237,20 @@ How a profile is applied (`emulate.go`, `device.go`):
   on Linux, contradicting the Chrome user agent and scoring the session as
   "tampered". With it the metrics line up as Windows Chrome's do.
 
-What a profile does not change: `hardwareConcurrency` and `deviceMemory`
-(the container's own numbers, plausible for a PC and consistent across
-page and workers, which an override would not be), the glyph shapes and
-antialiasing behind the font names (Selawik is not Segoe UI, and Linux
-does not render like DirectWrite), canvas and audio rendering, the media
-devices and speech voices, and the WebGL capabilities behind the renderer
-string (SwiftShader's limits, not a GeForce's). A determined fingerprinting
-script can tell; a site deciding what to show a Windows Chrome user cannot.
+What a profile does not change is what a Linux container without a GPU
+cannot fake convincingly: the glyph shapes and antialiasing behind the font
+names (Selawik is not Segoe UI, and Linux does not render like DirectWrite),
+canvas and audio rendering, the media devices and speech voices, and above
+all the WebGL *rendering* — the renderer string says GeForce, but the pixels
+and the capabilities behind it are SwiftShader's, which a script that hashes a
+WebGL draw or reads its limits can still tell apart from real hardware. Nor
+does it supply human behaviour: mouse movement, timing and interaction
+history. Anti-bot services that weigh those — Cloudflare, and the
+PerimeterX/HUMAN "press and hold" that Walmart runs — can still challenge a
+session the fingerprint alone would pass, especially a "cold" one with no
+interaction, and their verdict is probabilistic and reputation-weighted. The
+profile makes the machine look like a consumer Windows PC; it does not make an
+automated visit look like a person's.
 
 `browser_fingerprint` reports the observable values from inside a session,
 and `testdata/fingerprint.js` is the same script: pasted into the DevTools

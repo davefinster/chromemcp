@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -88,10 +89,15 @@ func TestDeviceProfiles(t *testing.T) {
 		t.Errorf("large viewport metrics: %+v", m)
 	}
 	js := w.initScript(ver)
-	for _, want := range []string{`"Win32"`, `"Google Inc. (NVIDIA)"`, `"152.0.7977.82"`, "webdriver", "getParameter"} {
+	for _, want := range []string{`"Win32"`, `"Google Inc. (NVIDIA)"`, `"152.0.7977.82"`, "webdriver", "getParameter",
+		`"deviceMemory":8`, `"hardwareConcurrency":8`, `"taskbar":48`, "availHeight"} {
 		if !strings.Contains(js, want) {
 			t.Errorf("init script lacks %s", want)
 		}
+	}
+	// A real browser never reports deviceMemory above the spec's cap of 8.
+	if w.DeviceMemory > 8 || w.DeviceMemory == 0 {
+		t.Errorf("deviceMemory %d: want 1..8", w.DeviceMemory)
 	}
 }
 
@@ -113,8 +119,10 @@ type fingerprint struct {
 			FullVersionList []struct{ Brand, Version string } `json:"fullVersionList"`
 		} `json:"highEntropy"`
 	} `json:"userAgentData"`
-	Screen struct{ Width, Height, AvailHeight int }
-	Window struct {
+	Screen              struct{ Width, Height, AvailWidth, AvailHeight int }
+	HardwareConcurrency int     `json:"hardwareConcurrency"`
+	DeviceMemory        float64 `json:"deviceMemory"`
+	Window              struct {
 		InnerWidth       int     `json:"innerWidth"`
 		InnerHeight      int     `json:"innerHeight"`
 		OuterWidth       int     `json:"outerWidth"`
@@ -261,6 +269,15 @@ func TestDeviceIntegration(t *testing.T) {
 		}
 		if fp.Window.OuterWidth <= fp.Window.InnerWidth || fp.Window.OuterHeight <= fp.Window.InnerHeight {
 			t.Errorf("%s: window has no frame: %+v", where, fp.Window)
+		}
+		// Consumer-PC numbers, not the container's server-class host values:
+		// deviceMemory never above the spec cap of 8, a plausible core count,
+		// and a taskbar reserved from the available height.
+		if fp.DeviceMemory > 8 || fp.DeviceMemory == 0 || fp.HardwareConcurrency == 0 || fp.HardwareConcurrency > 16 {
+			t.Errorf("%s: deviceMemory=%v hardwareConcurrency=%d (want <=8 and a consumer core count)", where, fp.DeviceMemory, fp.HardwareConcurrency)
+		}
+		if fp.Screen.AvailHeight >= fp.Screen.Height || fp.Screen.AvailWidth != fp.Screen.Width {
+			t.Errorf("%s: no taskbar: avail %dx%d of %dx%d", where, fp.Screen.AvailWidth, fp.Screen.AvailHeight, fp.Screen.Width, fp.Screen.Height)
 		}
 		if !fp.Media["(hover: hover)"] || !fp.Media["(pointer: fine)"] {
 			t.Errorf("%s: pointer media %v", where, fp.Media)
@@ -497,6 +514,11 @@ func TestClientHintHeaders(t *testing.T) {
 	if h["sec-ch-ua"] != `"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"` {
 		t.Errorf("sec-ch-ua: %q", h["sec-ch-ua"])
 	}
+	// The device-memory hint is capped at 8 (a real browser never sends more),
+	// in both its modern and legacy header names.
+	if h["sec-ch-device-memory"] != "8" || h["device-memory"] != "8" {
+		t.Errorf("device-memory hints: %q / %q", h["sec-ch-device-memory"], h["device-memory"])
+	}
 }
 
 func TestFontPrefs(t *testing.T) {
@@ -544,5 +566,54 @@ func TestMergeProfilePrefs(t *testing.T) {
 	}
 	if wp["fonts"].(map[string]any)["fixed"].(map[string]any)["Zyyy"] != "Consolas" {
 		t.Error("merge did not add the new font families")
+	}
+}
+
+// TestDeviceMemoryHeader checks that the emulator's request interception caps
+// the Sec-CH-Device-Memory / Device-Memory headers (the container leaks its
+// host's 16/32 GB, which a real browser can never report) to match the JS
+// navigator.deviceMemory, so a request and script agree on a plausible value.
+func TestDeviceMemoryHeader(t *testing.T) {
+	mgr := testChrome(t)
+	var mu sync.Mutex
+	got := map[string]http.Header{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got[r.URL.Path] = r.Header.Clone()
+		mu.Unlock()
+		w.Header().Set("Accept-CH", "Sec-CH-Device-Memory, Device-Memory")
+		w.Write([]byte(`<title>x</title>hi`))
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	s, err := mgr.start(ctx, startOptions{Device: "windows"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = mgr.withTab(ctx, s.meta.ID, "", func(ctx context.Context, s *session, tb *tab) error {
+		if err := navigate(ctx, tb, srv.URL, 20*time.Second); err != nil { // learns Accept-CH
+			return err
+		}
+		if err := navigate(ctx, tb, srv.URL+"/2", 20*time.Second); err != nil { // now sends the hint
+			return err
+		}
+		var jsMem float64
+		if out, err := evaluate(ctx, tb, `navigator.deviceMemory`, 5*time.Second); err == nil {
+			fmt.Sscanf(out, "%g", &jsMem)
+		}
+		mu.Lock()
+		h := got["/2"]
+		mu.Unlock()
+		if h.Get("Sec-CH-Device-Memory") != "8" || h.Get("Device-Memory") != "8" {
+			t.Errorf("device-memory header: sec-ch=%q legacy=%q, want 8", h.Get("Sec-CH-Device-Memory"), h.Get("Device-Memory"))
+		}
+		if jsMem != 8 {
+			t.Errorf("navigator.deviceMemory=%v, want 8 (must match the header)", jsMem)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

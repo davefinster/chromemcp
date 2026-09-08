@@ -50,6 +50,15 @@ type deviceProfile struct {
 	ScreenWidth, ScreenHeight int
 	// Scale is window.devicePixelRatio; 0 means 1.
 	Scale float64
+	// DeviceMemory is navigator.deviceMemory in GB (a real browser only ever
+	// reports 0.25/0.5/1/2/4/8); 0 leaves Chrome's. HardwareConcurrency is
+	// navigator.hardwareConcurrency; 0 leaves Chrome's. Both default, in the
+	// container, to the host's server-class numbers, which mark a VM.
+	DeviceMemory        int
+	HardwareConcurrency int
+	// TaskbarHeight is the pixels a desktop reserves from screen.availHeight
+	// (a real Windows taskbar); 0 leaves availHeight == height.
+	TaskbarHeight int
 	// Pointer is what the pointer/hover media queries answer: "fine" (a
 	// mouse: pointer fine, hover hover) or "coarse" (a touchscreen). "" is
 	// Chrome's own answer, which without an input device is none.
@@ -91,10 +100,15 @@ var deviceProfiles = map[string]*deviceProfile{
 		ScreenWidth:       1920,
 		ScreenHeight:      1080,
 		Scale:             1,
-		Pointer:           "fine",
-		WebGLVendor:       "Google Inc. (NVIDIA)",
-		WebGLRenderer:     "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002504) Direct3D11 vs_5_0 ps_5_0, D3D11)",
-		FontsConf:         windowsFontsConf,
+		// A consumer Windows PC: 8 GB (the spec's cap, so it can't betray a
+		// bigger host), 8 logical cores, and a taskbar reserving 48px.
+		DeviceMemory:        8,
+		HardwareConcurrency: 8,
+		TaskbarHeight:       48,
+		Pointer:             "fine",
+		WebGLVendor:         "Google Inc. (NVIDIA)",
+		WebGLRenderer:       "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002504) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+		FontsConf:           windowsFontsConf,
 		// The generic-family defaults Chrome ships on Windows. Blink
 		// resolves the CSS generics through these names, which FontsConf
 		// maps to stand-ins, so a script that measures `fantasy` (Impact,
@@ -217,15 +231,16 @@ func (d *deviceProfile) userAgentOverride(ver chromeVersion) *emulation.SetUserA
 	}
 }
 
-// clientHintHeaders are the low-entropy client-hint request headers the
-// profile stands for: Sec-CH-UA-Platform, Sec-CH-UA-Mobile and the Sec-CH-UA
-// brand list, lowercase name to value. The emulator stamps them onto every
-// request (emulate.go), because a tab's first navigation — a popup, or one
-// the owner opens in the live view — is requested by the browser before the
-// per-target user-agent override can reach it, and the command-line flag
-// sets only the user-agent string, not these. Only headers already on a
-// request are rewritten, never added, so a request carries exactly the hints
-// Chrome chose to send, with the platform corrected.
+// clientHintHeaders are the client-hint request headers the profile stands
+// for, lowercase name to value. The emulator stamps them onto every request
+// (emulate.go): a tab's first navigation — a popup, or one the owner opens in
+// the live view — is requested by the browser before the per-target user-agent
+// override can reach it, and the command-line flag sets only the user-agent
+// string; and Sec-CH-Device-Memory is never covered by the UA override at all,
+// so the container's host memory (16/32) leaks into it — an impossible value
+// (a real browser caps the hint at 8) that anti-bots read as a VM. Only headers
+// already on a request are rewritten, never added, so a request carries exactly
+// the hints Chrome chose to send, with the machine ones corrected.
 func (d *deviceProfile) clientHintHeaders(ver chromeVersion) map[string]string {
 	if !d.emulated() {
 		return nil
@@ -241,11 +256,19 @@ func (d *deviceProfile) clientHintHeaders(ver chromeVersion) map[string]string {
 	if d.CHMobile {
 		mobile = "?1"
 	}
-	return map[string]string{
+	h := map[string]string{
 		"sec-ch-ua-platform": fmt.Sprintf("%q", d.CHPlatform),
 		"sec-ch-ua-mobile":   mobile,
 		"sec-ch-ua":          brands.String(),
 	}
+	if d.DeviceMemory > 0 {
+		// The header form is a bare number ("8"); its legacy name is
+		// Device-Memory, still sent alongside the Sec-CH- one.
+		mem := fmt.Sprintf("%d", d.DeviceMemory)
+		h["sec-ch-device-memory"] = mem
+		h["device-memory"] = mem
+	}
+	return h
 }
 
 // fontPrefs is the Preferences fragment that sets Blink's generic-family
@@ -320,13 +343,21 @@ func (d *deviceProfile) initScript(ver chromeVersion) string {
 	if !d.emulated() {
 		return ""
 	}
-	q := func(s string) string { b, _ := json.Marshal(s); return string(b) }
-	return fmt.Sprintf(deviceInitScript, q(d.Platform), q(d.WebGLVendor), q(d.WebGLRenderer), q(ver.Full))
+	b, _ := json.Marshal(map[string]any{
+		"platform":            d.Platform,
+		"vendor":              d.WebGLVendor,
+		"renderer":            d.WebGLRenderer,
+		"fullVersion":         ver.Full,
+		"deviceMemory":        d.DeviceMemory,        // 0: leave Chrome's
+		"hardwareConcurrency": d.HardwareConcurrency, // 0: leave Chrome's
+		"taskbar":             d.TaskbarHeight,       // 0: leave availHeight == height
+	})
+	return fmt.Sprintf(deviceInitScript, string(b))
 }
 
 const deviceInitScript = `(() => {
   'use strict';
-  const P = {platform: %s, vendor: %s, renderer: %s, fullVersion: %s};
+  const P = %s;
   const natives = new WeakMap();
   const nativeToString = Function.prototype.toString;
   const mask = (fn, name) => {
@@ -357,6 +388,27 @@ const deviceInitScript = `(() => {
   // person's Chrome says false.
   if (typeof Navigator !== 'undefined') {
     getter(Navigator.prototype, 'webdriver', function () { return false; });
+  }
+  // navigator.deviceMemory and hardwareConcurrency. The container reports its
+  // host's numbers — deviceMemory 16/32 (a real browser caps it at 8, so
+  // anything higher is impossible and marks a VM) and a server-class core
+  // count — so pin them to a consumer PC's, in the page and in workers.
+  const NavProto = self.Navigator ? Navigator.prototype : (typeof WorkerNavigator !== 'undefined' ? WorkerNavigator.prototype : null);
+  if (NavProto && P.deviceMemory) {
+    getter(NavProto, 'deviceMemory', function () { return P.deviceMemory; });
+  }
+  if (NavProto && P.hardwareConcurrency) {
+    getter(NavProto, 'hardwareConcurrency', function () { return P.hardwareConcurrency; });
+  }
+  // screen.availHeight: a Windows desktop reserves the taskbar, so the
+  // available height is a little less than the screen height. Emulated
+  // device metrics leave them equal (no taskbar), which reads as "no real
+  // desktop"; reserve the taskbar and keep availWidth == width, avail top/left 0.
+  if (typeof Screen !== 'undefined' && P.taskbar) {
+    getter(Screen.prototype, 'availHeight', function () { return Math.max(0, this.height - P.taskbar); });
+    getter(Screen.prototype, 'availWidth', function () { return this.width; });
+    getter(Screen.prototype, 'availTop', function () { return 0; });
+    getter(Screen.prototype, 'availLeft', function () { return 0; });
   }
   // WEBGL_debug_renderer_info: the GPU strings, only where the real
   // getParameter would have answered (the extension must be enabled).
