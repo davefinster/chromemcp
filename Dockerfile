@@ -41,7 +41,7 @@ RUN apt-get update \
       google-chrome-stable \
       tigervnc-standalone-server novnc \
       nodejs npm \
-      fontconfig fonts-liberation fonts-dejavu-core fonts-crosextra-carlito fonts-crosextra-caladea \
+      fontconfig fonts-liberation fonts-liberation-sans-narrow fonts-dejavu-core fonts-crosextra-carlito fonts-crosextra-caladea \
       fonts-noto-core fonts-noto-color-emoji fonts-noto-cjk \
       tzdata procps \
  && curl -fsSL -o /tmp/selawik.zip "${SELAWIK_URL}" \

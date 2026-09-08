@@ -450,6 +450,18 @@ func TestWindowsFontsConf(t *testing.T) {
 			t.Errorf("conf mentions %s, which is not installed", absent)
 		}
 	}
+	// Impact (Blink's `fantasy`) prefers the condensed narrow font when it
+	// is installed, and falls back to Carlito — always in the image — when
+	// the separate narrow package is not, so `fantasy` stays under the
+	// width a font-fingerprinting script reads as Firefox.
+	withNarrow := map[string]bool{"Liberation Sans Narrow": true, "Carlito": true, "Liberation Sans": true, "Selawik": true, "DejaVu Sans": true, "Noto Sans CJK JP": true}
+	if c := windowsFontsConf(withNarrow); !strings.Contains(c, `<family>Impact</family><prefer><family>Liberation Sans Narrow</family>`) {
+		t.Error("Impact should prefer Liberation Sans Narrow when installed")
+	}
+	noNarrow := map[string]bool{"Carlito": true, "Liberation Sans": true, "Selawik": true, "DejaVu Sans": true, "Noto Sans CJK JP": true}
+	if c := windowsFontsConf(noNarrow); !strings.Contains(c, `<family>Impact</family><prefer><family>Carlito</family>`) {
+		t.Error("Impact should fall back to Carlito when the narrow package is absent")
+	}
 	// With no list, everything is assumed present.
 	all := windowsFontsConf(nil)
 	if !strings.Contains(all, `<family>Segoe UI</family><prefer><family>Selawik</family>`) || !strings.Contains(all, "<family>Meiryo</family>") {

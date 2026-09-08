@@ -43,8 +43,13 @@ var (
 	arial   = []string{"Liberation Sans", "Arimo", "DejaVu Sans"}
 	// Impact and Arial Narrow are condensed; the narrow stand-in keeps them
 	// visibly tighter than the body sans, which is also what makes the CSS
-	// `fantasy` generic (Blink resolves it to Impact) measure narrow.
-	narrow   = []string{"Liberation Sans Narrow", "Liberation Sans"}
+	// `fantasy` generic (Blink resolves it to Impact) measure narrow — the
+	// tell that keeps a font-fingerprinting script reading the box as Chrome
+	// and not Firefox. Liberation Sans Narrow (fonts-liberation-sans-narrow,
+	// a separate package from fonts-liberation) is the closest match; Carlito
+	// is a narrower-than-body fallback that is always in the image, so the
+	// generic stays under the threshold even if the narrow package is absent.
+	narrow   = []string{"Liberation Sans Narrow", "Carlito", "Liberation Sans"}
 	times    = []string{"Liberation Serif", "Tinos", "DejaVu Serif"}
 	georgia  = []string{"DejaVu Serif", "Liberation Serif"}
 	courier  = []string{"Liberation Mono", "Cousine", "DejaVu Sans Mono"}

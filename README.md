@@ -309,9 +309,11 @@ the identity unless it is saved again.
 `.github/workflows/docker.yml`. Debian trixie with Google Chrome from
 Google's own apt repository (which serves both architectures), TigerVNC's
 Xvnc, noVNC, Node 20 and `chrome-devtools-mcp` 1.8.0, and the fonts the
-device profiles draw on (Liberation, DejaVu, Carlito, Caladea, Noto, and
-Selawik from its GitHub release, checksum pinned); runs as uid 1000 with
-identities on `/data/identities` and sessions under `/tmp`:
+device profiles draw on (Liberation, Liberation Sans Narrow — a separate
+package from Liberation, and the condensed stand-in for Impact and Arial
+Narrow — DejaVu, Carlito, Caladea, Noto, and Selawik from its GitHub release,
+checksum pinned); runs as uid 1000 with identities on `/data/identities` and
+sessions under `/tmp`:
 
 ```bash
 docker run -d --name chromemcp -p 127.0.0.1:8787:8787 -v chromemcp:/data --shm-size=1g \
