@@ -76,7 +76,7 @@ type sessionMeta struct {
 	LastUsed  time.Time `json:"last_used"`
 	Width     int       `json:"width"`
 	Height    int       `json:"height"`
-	Device    string    `json:"device,omitempty"`   // device profile (device.go); "" is default
+	Device    string    `json:"device,omitempty"`   // device profile name (device.go), see deviceName
 	Timezone  string    `json:"timezone,omitempty"` // IANA zone Chrome runs in; "" is the server's
 	Locale    string    `json:"locale,omitempty"`   // Chrome's --lang; "" is the server's
 	LastURL   string    `json:"last_url,omitempty"`
@@ -279,9 +279,9 @@ func (m *manager) start(ctx context.Context, o startOptions) (*session, error) {
 	if err != nil {
 		return nil, err
 	}
-	if dev.Name == "default" {
-		o.Device = ""
-	}
+	// Recorded by name, so the session keeps the profile it was started with
+	// whatever the default becomes.
+	o.Device = dev.Name
 	if o.Timezone != "" {
 		if _, err := time.LoadLocation(o.Timezone); err != nil {
 			return nil, fmt.Errorf("timezone %q: want an IANA zone such as Europe/London or Australia/Sydney", o.Timezone)
@@ -335,13 +335,20 @@ func identitySuffix(identity string) string {
 	return ", identity " + identity
 }
 
+// deviceName is the session's device profile. Metadata written before
+// profiles were recorded has none, and those sessions were this Chrome as
+// it is -- not whatever the default is now.
+func (m *sessionMeta) deviceName() string {
+	if m.Device == "" {
+		return nativeDevice
+	}
+	return m.Device
+}
+
 // deviceSuffix describes the emulation for listings: ", device windows,
 // timezone Europe/London".
 func (m *sessionMeta) deviceSuffix() string {
-	var parts []string
-	if m.Device != "" {
-		parts = append(parts, "device "+m.Device)
-	}
+	parts := []string{"device " + m.deviceName()}
 	if m.Timezone != "" {
 		parts = append(parts, "timezone "+m.Timezone)
 	}
@@ -579,7 +586,7 @@ func (s *session) launch(ctx context.Context) error {
 	}
 	cfg := s.mgr.cfg
 	w, h := s.meta.Width, s.meta.Height
-	dev, err := lookupDevice(s.meta.Device)
+	dev, err := lookupDevice(s.meta.deviceName())
 	if err != nil {
 		return err
 	}

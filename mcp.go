@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,10 +45,11 @@ cheaply; browser_screenshot with labels=true overlays the refs on the picture.
 devtools_tools / devtools_call pass a session through to Google's chrome-devtools-mcp
 (network requests, performance traces, emulation, and more) on the same Chrome.
 
-DEVICE PROFILES: session_start device="windows" makes the session look like a Windows
-11 PC running Chrome to the sites it visits — user agent, client hints, navigator.platform,
-screen, GPU — for testing how a site behaves for such a user; the default is this
-server's own Chrome (Linux). timezone and locale are set per session the same way.`
+DEVICE PROFILES: by default a session looks like a Windows 11 PC running Chrome to the
+sites it visits — user agent, client hints, navigator.platform, screen, GPU — which is
+what most sites expect of an ordinary visitor. session_start device="linux" is this
+server's own Chrome as it is, for comparing how a site treats the two. timezone and
+locale are set per session the same way.`
 
 type mcpApp struct {
 	mgr   *manager
@@ -171,7 +173,7 @@ type sessionStartIn struct {
 	Identity string `json:"identity,omitempty" jsonschema:"start on a copy of this saved identity's profile, i.e. already logged in as that user (identity_list)"`
 	Label    string `json:"label,omitempty" jsonschema:"a short note on what the session is for, shown by session_list"`
 	Viewport string `json:"viewport,omitempty" jsonschema:"page size WxH, e.g. 1280x800 (the server default) or 390x844 for a phone-sized page"`
-	Device   string `json:"device,omitempty" jsonschema:"device profile the browser presents to sites: default (this server's own Chrome, Linux) or windows (a Windows 11 PC running Chrome: Windows user agent and client hints, navigator.platform Win32, 1920x1080 screen, NVIDIA GPU strings)"`
+	Device   string `json:"device,omitempty" jsonschema:"device profile the browser presents to sites: windows (the default: a Windows 11 PC running Chrome, with Windows user agent and client hints, navigator.platform Win32, 1920x1080 screen, NVIDIA GPU strings) or linux (this server's own Chrome as it is, no emulation)"`
 	Timezone string `json:"timezone,omitempty" jsonschema:"IANA time zone the browser runs in, e.g. Europe/London or Australia/Sydney (default: the server's, UTC in the container)"`
 	Locale   string `json:"locale,omitempty" jsonschema:"browser language as a tag, e.g. en-US, en-GB, de-DE: sets Accept-Language, navigator.language and the Intl defaults (default: the server's, en-US)"`
 	URL      string `json:"url,omitempty" jsonschema:"open this URL right away"`
@@ -319,22 +321,27 @@ type devtoolsCallIn struct {
 }
 
 // sessionStartSchema is the reflected schema for sessionStartIn with the
-// closed-set arguments -- mode and device -- advertised as enums, so a client
-// sees the valid values in the schema itself and not only in the prose. The
-// device list comes from the registered profiles, so a new profile is
-// advertised the moment it exists.
+// closed-set arguments -- mode and device -- advertised as enums with their
+// defaults, so a client sees the valid values and what it gets without
+// asking in the schema itself and not only in the prose. The device list
+// comes from the registered profiles, so a new profile is advertised the
+// moment it exists. The SDK also validates calls against this and fills the
+// defaults in, so the handler sees the same resolution a reader of the
+// schema expects.
 func sessionStartSchema() *jsonschema.Schema {
 	s, err := jsonschema.For[sessionStartIn](nil)
 	if err != nil {
 		panic(err)
 	}
 	s.Properties["mode"].Enum = []any{modeHeadless, modeHeadful}
+	s.Properties["mode"].Default = json.RawMessage(strconv.Quote(modeHeadless))
 	names := deviceNames()
 	devs := make([]any, len(names))
 	for i, n := range names {
 		devs[i] = n
 	}
 	s.Properties["device"].Enum = devs
+	s.Properties["device"].Default = json.RawMessage(strconv.Quote(defaultDevice))
 	return s
 }
 
@@ -346,7 +353,8 @@ func (a *mcpApp) register(s *mcp.Server) {
 		Description: "Start a new Chrome: a fresh profile (nothing logged in, no history), or a copy of a saved identity's profile " +
 			"(already logged in as that user). Returns the session_id every other tool needs. Headless by default; " +
 			"mode=headful for a browser a person can watch and drive (session_view), or for sites that block headless Chrome. " +
-			"device=windows presents the session to sites as a Windows 11 PC running Chrome; timezone and locale set where and in what language it runs.",
+			"Presents itself to sites as a Windows 11 PC running Chrome unless device=linux asks for this server's own Chrome as it is; " +
+			"timezone and locale set where and in what language it runs.",
 		Annotations: acts("Start a browser session"),
 	}, a.sessionStart)
 	mcp.AddTool(s, &mcp.Tool{
@@ -605,8 +613,8 @@ func (a *mcpApp) sessionList(ctx context.Context, req *mcp.CallToolRequest, in s
 		sb.WriteString("\n")
 	}
 	cfg := a.mgr.cfg
-	fmt.Fprintf(&sb, "\nidle sessions are parked after %s and deleted after %s unused; headful: %v; device profiles: %s",
-		cfg.IdlePark, cfg.MaxAge, cfg.Xvnc != "", strings.Join(deviceNames(), ", "))
+	fmt.Fprintf(&sb, "\nidle sessions are parked after %s and deleted after %s unused; headful: %v; device profiles: %s (default %s)",
+		cfg.IdlePark, cfg.MaxAge, cfg.Xvnc != "", strings.Join(deviceNames(), ", "), defaultDevice)
 	return text(sb.String()), nil, nil
 }
 

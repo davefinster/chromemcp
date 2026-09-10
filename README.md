@@ -24,7 +24,7 @@ One Go binary, four parts:
 
 | tool | purpose |
 |---|---|
-| `session_start` | a new Chrome on a fresh profile, or on a copy of an identity's; `mode` headless (default) or headful; `device` profile (`default` or `windows`), `timezone`, `locale`; `viewport`, `label`, `url` |
+| `session_start` | a new Chrome on a fresh profile, or on a copy of an identity's; `mode` headless (default) or headful; `device` profile (`windows`, the default, or `linux`), `timezone`, `locale`; `viewport`, `label`, `url` |
 | `session_list` | running and parked sessions (what can be resumed), plus the saved identities |
 | `session_resume` / `session_stop` | relaunch a parked session with its cookies, storage and tabs; park a running one |
 | `session_delete` | close and erase a session |
@@ -128,15 +128,19 @@ claude.ai ──HTTPS──▶ edge ──▶ chromemcp :8787
 
 A session's Chrome is this server's Chrome: Linux, a container's screen, a
 software GPU, and in headless mode a user agent that says `HeadlessChrome`.
-For testing how a site behaves for a particular kind of user, `session_start`
-takes a `device` profile that changes what the browser says about the
-machine it runs on — never the browser itself, since a site can compare the
-two and Chrome's version, features and TLS fingerprint stay its own.
+A `device` profile on `session_start` changes what the browser says about
+the machine it runs on — never the browser itself, since a site can compare
+the two and Chrome's version, features and TLS fingerprint stay its own.
+The default is `windows`: what most of the web expects of an ordinary
+visitor, and what its bot heuristics score as one; `linux` is this Chrome
+as it is, for comparing how a site treats the two. A session records the
+profile it was started with, so a parked one resumes as what it was (one
+from before profiles were recorded is `linux`, which is what it was).
 
 | profile | what sites see |
 |---|---|
-| `default` | this Chrome as it is |
-| `windows` | a Windows 11 PC running the same Chrome version: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) … Chrome/N.0.0.0 …`; `Sec-CH-UA-Platform: "Windows"` with the high-entropy hints of a 64-bit x86 desktop on 24H2 (`platformVersion` 19.0.0); `navigator.platform` `Win32`; `navigator.userAgentData` to match; a 1920×1080 display at 100 % scale; an NVIDIA GeForce RTX 3060 under ANGLE/D3D11 in `WEBGL_debug_renderer_info`; `navigator.webdriver` false |
+| `linux` | this Chrome as it is |
+| `windows` (default) | a Windows 11 PC running the same Chrome version: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) … Chrome/N.0.0.0 …`; `Sec-CH-UA-Platform: "Windows"` with the high-entropy hints of a 64-bit x86 desktop on 24H2 (`platformVersion` 19.0.0); `navigator.platform` `Win32`; `navigator.userAgentData` to match; a 1920×1080 display at 100 % scale; an NVIDIA GeForce RTX 3060 under ANGLE/D3D11 in `WEBGL_debug_renderer_info`; `navigator.webdriver` false |
 
 Independently of the profile, `timezone` (an IANA zone) and `locale` (a
 language tag) set where and in what language the browser runs — `TZ` and
@@ -370,6 +374,6 @@ client hints, checked on the page, in a worker, in a service worker, in a
 popup (where the platform hint on the popup's own first navigation is checked,
 the request-interception path), after a park and resume, and (with an Xvnc on
 PATH) headful, including the framed outer-window size and that the `fantasy`
-generic measures narrower than `system-ui`; and the default profile's brand
+generic measures narrower than `system-ui`; and the `linux` profile's brand
 list against the algorithm. They skip themselves where there is no Chrome, as
 in the image's build stage; `CHROMEMCP_TEST_NO_CHROME=1` skips them anywhere.

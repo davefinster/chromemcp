@@ -49,19 +49,34 @@ func TestDeviceProfiles(t *testing.T) {
 	if _, err := lookupDevice("android"); err == nil || !strings.Contains(err.Error(), "windows") {
 		t.Errorf("unknown device: %v", err)
 	}
-	d, err := lookupDevice("")
-	if err != nil || d.Name != "default" || d.emulated() {
+	// No profile asked for is the Windows one; the native profile is by name.
+	if defaultDevice != "windows" {
+		t.Errorf("default device is %q", defaultDevice)
+	}
+	if d, err := lookupDevice(""); err != nil || d.Name != defaultDevice || !d.emulated() {
 		t.Fatalf("default: %+v %v", d, err)
+	}
+	d, err := lookupDevice(nativeDevice)
+	if err != nil || d.Name != "linux" || d.emulated() {
+		t.Fatalf("native: %+v %v", d, err)
+	}
+	// Metadata from before the profile was recorded means the native one,
+	// not the current default; recorded names are kept.
+	if n := (&sessionMeta{}).deviceName(); n != nativeDevice {
+		t.Errorf("legacy metadata resolves to %q", n)
+	}
+	if n := (&sessionMeta{Device: "windows"}).deviceName(); n != "windows" {
+		t.Errorf("recorded device resolves to %q", n)
 	}
 	ver := chromeVersion{Full: "152.0.7977.82", Major: "152"}
 	if d.userAgentOverride(ver) != nil || d.initScript(ver) != "" || d.chromeFlags(ver) != nil {
-		t.Error("default profile emulates something")
+		t.Error("native profile emulates something")
 	}
 	if m := d.metrics(1280, 800, false); m != nil {
-		t.Errorf("default headful metrics: %+v", m)
+		t.Errorf("native headful metrics: %+v", m)
 	}
 	if m := d.metrics(1280, 800, true); m == nil || m.Width != 1280 || m.Height != 800 || m.ScreenWidth != 0 || m.DeviceScaleFactor != 1 {
-		t.Errorf("default headless metrics: %+v", m)
+		t.Errorf("native headless metrics: %+v", m)
 	}
 
 	w, err := lookupDevice("windows")
@@ -210,11 +225,24 @@ func TestDeviceIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The default profile is Chrome as it is — and its own brand list is
-	// what the algorithm must reproduce for this version.
+	// A session asked for with no profile is recorded as the Windows one.
 	s, err := mgr.start(ctx, startOptions{})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if s.meta.Device != "windows" || !strings.Contains(s.meta.deviceSuffix(), "device windows") {
+		t.Errorf("unasked-for device recorded as %q (%s)", s.meta.Device, s.meta.deviceSuffix())
+	}
+	mgr.remove(s.meta.ID)
+
+	// The native profile is Chrome as it is — and its own brand list is
+	// what the algorithm must reproduce for this version.
+	s, err = mgr.start(ctx, startOptions{Device: nativeDevice})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.meta.Device != "linux" {
+		t.Errorf("native device recorded as %q", s.meta.Device)
 	}
 	err = mgr.withTab(ctx, s.meta.ID, "", func(ctx context.Context, s *session, tb *tab) error {
 		if err := navigate(ctx, tb, es.URL, 20*time.Second); err != nil {
@@ -222,7 +250,7 @@ func TestDeviceIntegration(t *testing.T) {
 		}
 		fp := readFingerprint(ctx, t, tb)
 		if !strings.Contains(fp.UserAgent, "Linux") || fp.UserAgentData == nil || fp.UserAgentData.Platform != "Linux" {
-			t.Errorf("default profile: ua %q, uad %+v", fp.UserAgent, fp.UserAgentData)
+			t.Errorf("native profile: ua %q, uad %+v", fp.UserAgent, fp.UserAgentData)
 		}
 		want := brandVersions(ver.Major, ver.Full, false)
 		for i, b := range fp.UserAgentData.Brands {
@@ -497,15 +525,15 @@ func TestWindowsFontsConf(t *testing.T) {
 	if p2, err := d.fontsConfFile(dir, installed); err != nil || p2 != p {
 		t.Errorf("second write: %s %v", p2, err)
 	}
-	if p, _ := deviceProfiles["default"].fontsConfFile(dir, installed); p != "" {
-		t.Error("default profile has a fonts file")
+	if p, _ := deviceProfiles[nativeDevice].fontsConfFile(dir, installed); p != "" {
+		t.Error("native profile has a fonts file")
 	}
 }
 
 func TestClientHintHeaders(t *testing.T) {
 	ver := chromeVersion{Full: "152.0.7977.82", Major: "152"}
-	if h := deviceProfiles["default"].clientHintHeaders(ver); h != nil {
-		t.Errorf("default has client-hint headers: %v", h)
+	if h := deviceProfiles[nativeDevice].clientHintHeaders(ver); h != nil {
+		t.Errorf("native profile has client-hint headers: %v", h)
 	}
 	h := deviceProfiles["windows"].clientHintHeaders(ver)
 	if h["sec-ch-ua-platform"] != `"Windows"` || h["sec-ch-ua-mobile"] != "?0" {
@@ -522,8 +550,8 @@ func TestClientHintHeaders(t *testing.T) {
 }
 
 func TestFontPrefs(t *testing.T) {
-	if deviceProfiles["default"].fontPrefs() != nil {
-		t.Error("default has font prefs")
+	if deviceProfiles[nativeDevice].fontPrefs() != nil {
+		t.Error("native profile has font prefs")
 	}
 	p := deviceProfiles["windows"].fontPrefs()
 	fonts := p["webkit"].(map[string]any)["webprefs"].(map[string]any)["fonts"].(map[string]any)

@@ -76,10 +76,20 @@ type deviceProfile struct {
 	FontFamilies map[string]string
 }
 
+// The profile a session gets when none is asked for, and the one that is
+// this Chrome unemulated. Windows is the default because it is what most
+// of the web expects to see and what its bot heuristics score as ordinary;
+// the native profile exists for comparing against it, and for what
+// sessions started before profiles were recorded in their metadata were.
+const (
+	defaultDevice = "windows"
+	nativeDevice  = "linux"
+)
+
 // deviceProfiles is the registry, by name.
 var deviceProfiles = map[string]*deviceProfile{
-	"default": {
-		Name:        "default",
+	nativeDevice: {
+		Name:        nativeDevice,
 		Description: "this server's own Chrome, as it is: Linux, no emulation",
 	},
 	"windows": {
@@ -135,9 +145,11 @@ func deviceNames() []string {
 	return names
 }
 
+// lookupDevice resolves a profile name as session_start takes it: "" is the
+// default profile.
 func lookupDevice(name string) (*deviceProfile, error) {
 	if name == "" {
-		name = "default"
+		name = defaultDevice
 	}
 	d, ok := deviceProfiles[name]
 	if !ok {

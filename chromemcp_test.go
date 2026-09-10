@@ -352,6 +352,7 @@ func TestToolRegistry(t *testing.T) {
 				Type        string   `json:"type"`
 				Description string   `json:"description"`
 				Enum        []string `json:"enum"`
+				Default     string   `json:"default"`
 			} `json:"properties"`
 		}
 		raw, err := json.Marshal(tool.InputSchema)
@@ -361,20 +362,23 @@ func TestToolRegistry(t *testing.T) {
 		if err := json.Unmarshal(raw, &schema); err != nil {
 			t.Fatal(err)
 		}
-		for prop, want := range map[string][]string{
-			"device": deviceNames(),
-			"mode":   {"headless", "headful"},
+		for prop, want := range map[string]struct {
+			enum []string
+			def  string
+		}{
+			"device": {deviceNames(), "windows"},
+			"mode":   {[]string{"headless", "headful"}, "headless"},
 		} {
 			got := schema.Properties[prop]
 			if got.Type != "string" || got.Description == "" {
 				t.Errorf("session_start.%s: type %q, description %q", prop, got.Type, got.Description)
 			}
-			if strings.Join(got.Enum, ",") != strings.Join(want, ",") {
-				t.Errorf("session_start.%s enum = %v, want %v", prop, got.Enum, want)
+			if strings.Join(got.Enum, ",") != strings.Join(want.enum, ",") || got.Default != want.def {
+				t.Errorf("session_start.%s enum = %v default %q, want %v default %q", prop, got.Enum, got.Default, want.enum, want.def)
 			}
-		}
-		if !slices.Contains(schema.Properties["device"].Enum, "windows") {
-			t.Errorf("device enum lacks windows: %v", schema.Properties["device"].Enum)
+			if !slices.Contains(got.Enum, got.Default) {
+				t.Errorf("session_start.%s default %q is outside its enum %v", prop, got.Default, got.Enum)
+			}
 		}
 	}
 	// A device outside the enum is refused by schema validation before any Chrome is launched.
