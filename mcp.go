@@ -17,6 +17,7 @@ import (
 
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/chromedp"
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -317,10 +318,31 @@ type devtoolsCallIn struct {
 	Arguments map[string]any `json:"arguments,omitempty" jsonschema:"its arguments, per the tool's input schema"`
 }
 
+// sessionStartSchema is the reflected schema for sessionStartIn with the
+// closed-set arguments -- mode and device -- advertised as enums, so a client
+// sees the valid values in the schema itself and not only in the prose. The
+// device list comes from the registered profiles, so a new profile is
+// advertised the moment it exists.
+func sessionStartSchema() *jsonschema.Schema {
+	s, err := jsonschema.For[sessionStartIn](nil)
+	if err != nil {
+		panic(err)
+	}
+	s.Properties["mode"].Enum = []any{modeHeadless, modeHeadful}
+	names := deviceNames()
+	devs := make([]any, len(names))
+	for i, n := range names {
+		devs[i] = n
+	}
+	s.Properties["device"].Enum = devs
+	return s
+}
+
 func (a *mcpApp) register(s *mcp.Server) {
 	// ---- sessions ----
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "session_start",
+		Name:        "session_start",
+		InputSchema: sessionStartSchema(),
 		Description: "Start a new Chrome: a fresh profile (nothing logged in, no history), or a copy of a saved identity's profile " +
 			"(already logged in as that user). Returns the session_id every other tool needs. Headless by default; " +
 			"mode=headful for a browser a person can watch and drive (session_view), or for sites that block headless Chrome. " +

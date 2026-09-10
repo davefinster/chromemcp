@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -339,6 +340,50 @@ func TestToolRegistry(t *testing.T) {
 	}
 	if len(res.Tools) != 30 {
 		t.Errorf("%d tools, want 30", len(res.Tools))
+	}
+	// session_start advertises its closed-set arguments as enums on the wire,
+	// so a client sees the valid values without reading the prose.
+	for _, tool := range res.Tools {
+		if tool.Name != "session_start" {
+			continue
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Type        string   `json:"type"`
+				Description string   `json:"description"`
+				Enum        []string `json:"enum"`
+			} `json:"properties"`
+		}
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatal(err)
+		}
+		for prop, want := range map[string][]string{
+			"device": deviceNames(),
+			"mode":   {"headless", "headful"},
+		} {
+			got := schema.Properties[prop]
+			if got.Type != "string" || got.Description == "" {
+				t.Errorf("session_start.%s: type %q, description %q", prop, got.Type, got.Description)
+			}
+			if strings.Join(got.Enum, ",") != strings.Join(want, ",") {
+				t.Errorf("session_start.%s enum = %v, want %v", prop, got.Enum, want)
+			}
+		}
+		if !slices.Contains(schema.Properties["device"].Enum, "windows") {
+			t.Errorf("device enum lacks windows: %v", schema.Properties["device"].Enum)
+		}
+	}
+	// A device outside the enum is refused by schema validation before any Chrome is launched.
+	r0, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "session_start", Arguments: map[string]any{"device": "amiga"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if txt := r0.Content[0].(*mcp.TextContent).Text; !r0.IsError || !strings.Contains(txt, "enum") || !strings.Contains(txt, "windows") {
+		t.Errorf("session_start device=amiga: isError=%v %q, want an enum error naming the valid devices", r0.IsError, txt)
 	}
 	// An unknown session is a tool error, not a transport error.
 	r, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "browser_navigate", Arguments: map[string]any{"session_id": "s-00000000", "url": "https://x.test"}})
