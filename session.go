@@ -500,6 +500,11 @@ func (m *manager) shutdown() {
 func (s *session) profileDir() string   { return filepath.Join(s.dir, "profile") }
 func (s *session) downloadsDir() string { return filepath.Join(s.dir, "downloads") }
 
+// filesDir holds the files the agent has put on the session for a page to
+// be given (files.go). Inside the session directory on purpose: deleting
+// the session deletes them.
+func (s *session) filesDir() string { return filepath.Join(s.dir, "files") }
+
 // mergeProfilePrefs deep-merges prefs into the profile's Default/Preferences
 // JSON (Chrome's per-profile settings), creating it if need be. Chrome
 // rewrites this file on a clean exit, keeping what it does not manage, so a

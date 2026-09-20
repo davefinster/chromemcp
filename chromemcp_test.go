@@ -266,7 +266,8 @@ func TestSnapshotRender(t *testing.T) {
 	    {"ref":"e1","role":"link","tag":"a","name":"Home","box":[1,2,30,10],"inView":true,"href":"https://a.test/"},
 	    {"ref":"e2","role":"textbox","tag":"input","name":"Email","type":"email","value":"x@y","box":[1,20,100,20],"inView":true},
 	    {"ref":"e3","role":"checkbox","tag":"input","name":"Remember","checked":true,"box":[1,50,10,10],"inView":false},
-	    {"ref":"e4","role":"combobox","tag":"select","name":"Country","value":"AU","options":["AU","NZ"],"box":[1,70,80,20],"inView":true,"disabled":true}
+	    {"ref":"e4","role":"combobox","tag":"select","name":"Country","value":"AU","options":["AU","NZ"],"box":[1,70,80,20],"inView":true,"disabled":true},
+	    {"ref":"e5","role":"file","tag":"input","name":"Attachment","type":"file","box":[1,90,100,20],"inView":true}
 	  ]}`), &r)
 	if err != nil {
 		t.Fatal(err)
@@ -278,6 +279,8 @@ func TestSnapshotRender(t *testing.T) {
 		`e3 checkbox "Remember" checked (offscreen)`,
 		`e4 combobox "Country" value="AU" disabled options=[AU | NZ]`,
 		"-- below/above the viewport",
+		// A file input is worth a word: nothing else says how one is filled.
+		"file_put puts one on the session, browser_upload gives it to the input",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("render lacks %q:\n%s", want, out)
@@ -329,8 +332,9 @@ func TestToolRegistry(t *testing.T) {
 	for _, want := range []string{
 		"session_start", "session_list", "session_resume", "session_stop", "session_delete", "session_view",
 		"identity_list", "identity_save", "identity_delete",
+		"file_put", "file_list", "file_delete",
 		"browser_navigate", "browser_history", "browser_snapshot", "browser_screenshot", "browser_click", "browser_type",
-		"browser_press", "browser_hover", "browser_scroll", "browser_select", "browser_wait", "browser_read",
+		"browser_press", "browser_hover", "browser_scroll", "browser_select", "browser_upload", "browser_wait", "browser_read",
 		"browser_evaluate", "browser_fingerprint", "browser_console", "browser_tabs", "browser_tab_new", "browser_tab_select", "browser_tab_close",
 		"devtools_tools", "devtools_call",
 	} {
@@ -338,8 +342,8 @@ func TestToolRegistry(t *testing.T) {
 			t.Errorf("tool %s not registered", want)
 		}
 	}
-	if len(res.Tools) != 30 {
-		t.Errorf("%d tools, want 30", len(res.Tools))
+	if len(res.Tools) != 34 {
+		t.Errorf("%d tools, want 34", len(res.Tools))
 	}
 	// session_start advertises its closed-set arguments as enums on the wire,
 	// so a client sees the valid values without reading the prose.

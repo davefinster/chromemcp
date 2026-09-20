@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -41,6 +42,12 @@ with refs (e12) — click and type by ref, or by text/selector, or by coordinate
 screenshot. Most actions return a screenshot so you can see the result; pass
 screenshot=false when you only need the text. browser_read gives the page's text
 cheaply; browser_screenshot with labels=true overlays the refs on the picture.
+
+FILES: to give a site a file — an attachment, a photo, a spreadsheet — put the bytes on
+the session first with file_put (base64, or plain text), then browser_upload hands it to
+the page's file input, which is what a person choosing it in the file dialog does. Target
+the input, or the upload button whose file chooser is then caught. A session's files live
+and die with it; file_list shows what one holds.
 
 devtools_tools / devtools_call pass a session through to Google's chrome-devtools-mcp
 (network requests, performance traces, emulation, and more) on the same Chrome.
@@ -192,6 +199,25 @@ type identitySaveIn struct {
 
 type identityIn struct {
 	Name string `json:"name" jsonschema:"the identity's name"`
+}
+
+type filePutIn struct {
+	SessionID string `json:"session_id" jsonschema:"the session to put the file on; it lives and dies with that session"`
+	Name      string `json:"name" jsonschema:"the file name the site will see, with the extension it expects: photo.jpg, resume.pdf, rows.csv"`
+	Content   string `json:"content,omitempty" jsonschema:"the file's bytes, base64-encoded (a data: URL is accepted too). Use this for anything binary"`
+	Text      string `json:"text,omitempty" jsonschema:"the file's contents as plain text, instead of content, for a text file (csv, json, svg, txt…)"`
+	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"replace a file of that name the session already holds"`
+}
+
+type fileNameIn struct {
+	SessionID string `json:"session_id" jsonschema:"the session"`
+	Name      string `json:"name" jsonschema:"the file's name, as file_list shows it"`
+}
+
+type uploadIn struct {
+	tabIn
+	targetSpec
+	Files []string `json:"files" jsonschema:"names of files already put on this session with file_put, in the order the input should hold them"`
 }
 
 // tabIn is the common prefix of the browser tools.
@@ -404,6 +430,26 @@ func (a *mcpApp) register(s *mcp.Server) {
 		Annotations: destructive("Delete an identity"),
 	}, a.identityDelete)
 
+	// ---- session files ----
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "file_put",
+		Description: "Put a file on a session so a page can be given it later: send the bytes as base64 (content) or as plain text (text), " +
+			"under the name the site should see. browser_upload then hands it to a page's file picker. " +
+			"The file belongs to the session — it survives parking and is deleted with it, and never becomes part of an identity.",
+		Annotations: acts("Put a file on a session"),
+	}, a.filePut)
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "file_list",
+		Description: "The files a session holds, with their sizes and the type a site will infer from each name.",
+		Annotations: readOnly("List session files"),
+	}, a.fileList)
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "file_delete",
+		Description: "Delete one of a session's files. A page given the file holds a reference to it, not a copy, so delete it once the " +
+			"upload has gone through rather than before.",
+		Annotations: destructive("Delete a session file"),
+	}, a.fileDelete)
+
 	// ---- browser ----
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "browser_navigate",
@@ -460,6 +506,14 @@ func (a *mcpApp) register(s *mcp.Server) {
 		Description: "Choose an option in a <select> drop-down, by value or visible text. Custom drop-downs are clicked like anything else.",
 		Annotations: acts("Select an option"),
 	}, a.selectOption)
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "browser_upload",
+		Description: "Give the page files from this session (file_put them first) exactly as a person choosing them in the file dialog would: " +
+			"the input is filled and the page's change handlers run. Target the file input by ref/selector/text — a hidden one behind a " +
+			"styled button is fine, it is never really clicked — or target the upload button itself and the file chooser it opens is caught. " +
+			"With no target, the page's only file input is used.",
+		Annotations: acts("Upload files to the page"),
+	}, a.upload)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "browser_wait",
 		Description: "Wait for something: a number of milliseconds, an element to appear (or disappear), text to appear, or the URL to change.",
@@ -595,6 +649,9 @@ func (a *mcpApp) sessionList(ctx context.Context, req *mcp.CallToolRequest, in s
 			fmt.Fprintf(&sb, "; created %s, last used %s ago", s.meta.Created.Format("Jan 2 15:04"), time.Since(time.Unix(0, s.lastUsed.Load())).Round(time.Second))
 			if tabs > 0 {
 				fmt.Fprintf(&sb, ", %d tabs", tabs)
+			}
+			if files, _ := s.listFiles(); len(files) > 0 {
+				fmt.Fprintf(&sb, ", %d files (%s)", len(files), fileNameList(files))
 			}
 			if u != "" {
 				fmt.Fprintf(&sb, "\n    at %s — %q", u, title)
@@ -732,6 +789,82 @@ func (a *mcpApp) identityDelete(ctx context.Context, req *mcp.CallToolRequest, i
 		return nil, nil, err
 	}
 	return text(fmt.Sprintf("identity %q deleted", in.Name)), nil, nil
+}
+
+// ---- session file tools ----
+
+func (a *mcpApp) filePut(ctx context.Context, req *mcp.CallToolRequest, in filePutIn) (*mcp.CallToolResult, any, error) {
+	if in.Content != "" && in.Text != "" {
+		return nil, nil, errors.New("give the file as content (base64) or as text, not both")
+	}
+	var data []byte
+	switch {
+	case in.Content != "":
+		b, err := decodeFileContent(in.Content)
+		if err != nil {
+			return nil, nil, err
+		}
+		data = b
+	case in.Text != "":
+		data = []byte(in.Text)
+	default:
+		return nil, nil, errors.New("give the file's bytes as content (base64) or its text as text")
+	}
+	s, err := a.mgr.get(in.SessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	// No Chrome needed, and none started: a parked session takes files too.
+	s.touch()
+	f, err := s.putFile(in.Name, data, in.Overwrite)
+	if err != nil {
+		return nil, nil, err
+	}
+	r := &result{}
+	typ := ""
+	if f.MIME != "" {
+		typ = ", " + f.MIME
+	}
+	r.addf("put %q on session %s (%s%s)", f.Name, s.meta.ID, humanBytes(f.Size), typ)
+	if f.MIME == "" {
+		r.addf("note: %q has no extension this server knows, so the site will see a file of no particular type; "+
+			"rename it with the extension the site expects if it filters by type", f.Name)
+	}
+	r.addf("browser_upload files=[%q] hands it to a page's file picker; it is deleted with the session", f.Name)
+	return text(strings.Join(r.lines, "\n")), nil, nil
+}
+
+func (a *mcpApp) fileList(ctx context.Context, req *mcp.CallToolRequest, in sessionIn) (*mcp.CallToolResult, any, error) {
+	s, err := a.mgr.get(in.SessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	files, err := s.listFiles()
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(files) == 0 {
+		return text(fmt.Sprintf("session %s holds no files; file_put adds one for a page's file picker", s.meta.ID)), nil, nil
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "session %s holds %d files (%s of the %s it may):\n", s.meta.ID, len(files), humanBytes(s.filesTotal(files)), humanBytes(maxSessionFileBytes))
+	for _, f := range files {
+		fmt.Fprintf(&sb, "- %s, put %s\n", f, f.Modified.Format("Jan 2 15:04"))
+	}
+	sb.WriteString("browser_upload gives them to a page's file input; they go when the session does.")
+	return text(sb.String()), nil, nil
+}
+
+func (a *mcpApp) fileDelete(ctx context.Context, req *mcp.CallToolRequest, in fileNameIn) (*mcp.CallToolResult, any, error) {
+	s, err := a.mgr.get(in.SessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	s.touch()
+	if err := s.deleteFile(in.Name); err != nil {
+		return nil, nil, err
+	}
+	return text(fmt.Sprintf("deleted %q from session %s", in.Name, s.meta.ID)), nil, nil
 }
 
 // ---- browser tools ----
@@ -1111,6 +1244,78 @@ func (a *mcpApp) selectOption(ctx context.Context, req *mcp.CallToolRequest, in 
 		time.Sleep(200 * time.Millisecond)
 		settle(ctx, t, 3*time.Second)
 		r.addf("selected %q (value %q) in %s", res.Selected, res.Value, in.targetSpec)
+		return a.finish(ctx, s, t, r, in.wantShot(), screenshotOpts{})
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return r.toolResult(), nil, nil
+}
+
+func (a *mcpApp) upload(ctx context.Context, req *mcp.CallToolRequest, in uploadIn) (*mcp.CallToolResult, any, error) {
+	if len(in.Files) == 0 {
+		return nil, nil, errors.New("give the name of at least one file put on the session with file_put (file_list shows them)")
+	}
+	r := &result{}
+	err := a.mgr.withTab(ctx, in.SessionID, in.Tab, func(ctx context.Context, s *session, t *tab) error {
+		paths, err := s.filePaths(in.Files)
+		if err != nil {
+			return err
+		}
+		what := fmt.Sprintf("%d files (%s)", len(paths), strings.Join(in.Files, ", "))
+		if len(paths) == 1 {
+			what = strconv.Quote(in.Files[0])
+		}
+		info, err := findFileTarget(ctx, t, in.targetSpec)
+		if err != nil {
+			return err
+		}
+		switch info.Mode {
+		case "input":
+			if info.Disabled {
+				return fmt.Errorf("%s is disabled; the page has to enable it first", info.describe())
+			}
+			if !info.Multiple && len(paths) > 1 {
+				return fmt.Errorf("%s takes one file at a time (no multiple attribute); upload them one by one", info.describe())
+			}
+			if err := setFilesOnElement(ctx, t, paths); err != nil {
+				return fmt.Errorf("giving the files to %s: %w", info.describe(), err)
+			}
+			r.addf("gave %s to %s", what, info.describe())
+		case "chooser":
+			res, err := resolveTarget(ctx, t, in.targetSpec)
+			if err != nil {
+				return err
+			}
+			r.addf("%s is no file input, so its file chooser was caught instead", res.describe())
+			if err := setFilesViaChooser(ctx, t, paths, func() error {
+				return clickAt(ctx, t, res.X, res.Y, "left", 1, 0)
+			}); err != nil {
+				return err
+			}
+			r.addf("clicked it and gave the chooser %s", what)
+		default:
+			return fmt.Errorf("unexpected file target mode %q", info.Mode)
+		}
+		time.Sleep(300 * time.Millisecond)
+		settle(ctx, t, 5*time.Second)
+		if have := fileInputContents(ctx, t); len(have) > 0 {
+			r.addf("the input now holds: %s", strings.Join(have, "; "))
+		}
+		// A site that filters by accept ignores what does not match, which
+		// looks exactly like nothing having happened.
+		if info.Accept != "" {
+			var wrong []string
+			for _, n := range in.Files {
+				if !acceptsFile(info.Accept, n) {
+					wrong = append(wrong, n)
+				}
+			}
+			if len(wrong) > 0 {
+				r.addf("note: the input accepts %q, which does not cover %s — the page may ignore it", info.Accept, strings.Join(wrong, ", "))
+			}
+		}
+		r.addf("the page has the files now; whatever it does next (a submit button, an auto-upload) still has to happen")
 		return a.finish(ctx, s, t, r, in.wantShot(), screenshotOpts{})
 	})
 	if err != nil {

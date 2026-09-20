@@ -13,8 +13,8 @@ One Go binary, four parts:
 
 | part | what |
 |---|---|
-| MCP server | Streamable HTTP (or stdio), OAuth-protected: AuthKit issuer, resource identifier, single-account email pin. 30 tools. |
-| sessions | One Chrome per session on its own profile directory, like the first launch on a clean workstation. Ephemeral: parked when idle (Chrome closed, profile kept, resumable), deleted when old. |
+| MCP server | Streamable HTTP (or stdio), OAuth-protected: AuthKit issuer, resource identifier, single-account email pin. 34 tools. |
+| sessions | One Chrome per session on its own profile directory, like the first launch on a clean workstation, with whatever files the agent has put on it for a page's file picker. Ephemeral: parked when idle (Chrome closed, profile kept, resumable), deleted when old. |
 | identities | Named snapshots of a profile the owner has logged into — the persistent part. A session started *as* an identity begins already signed in. |
 | live view | Headful sessions render on an Xvnc display; a token link serves noVNC over the server's own websocket bridge, so a person can watch, take over, and sign in where no agent can (passkeys, 2FA). |
 
@@ -38,6 +38,18 @@ One Go binary, four parts:
 | `identity_save` | snapshot a session's profile and cookie jar under a name (Chrome is closed cleanly around the copy and started again) |
 | `identity_delete` | remove one |
 
+**Session files** — bytes the agent puts on a session for a page to be given
+later, deleted with it
+
+| tool | purpose |
+|---|---|
+| `file_put` | write a file onto a session: `content` (base64, or a `data:` URL) or `text`, under the `name` the site should see; `overwrite` replaces one |
+| `file_list` | what a session holds, with sizes and the type each name implies |
+| `file_delete` | remove one — after the upload has gone through: a page given a file holds a reference to it, not a copy |
+
+Up to 20 MB a file and 100 MB (or 50 files) a session — the bytes travel in
+the tool call, so a large file is a large request.
+
 **Browser** (every tool takes `session_id`, optionally `tab`; most return a
 screenshot, `screenshot=false` turns it off)
 
@@ -49,6 +61,7 @@ screenshot, `screenshot=false` turns it off)
 | `browser_click`, `browser_hover` | by ref, visible text, CSS selector, or viewport coordinates; real mouse events |
 | `browser_type`, `browser_press`, `browser_select` | type into a field (optionally clear, submit); press keys with modifiers; choose a `<select>` option |
 | `browser_scroll` | wheel-scroll the page, or bring an element into view |
+| `browser_upload` | give the page files from the session (`file_put` them first) as the file dialog would — the input itself, a hidden one behind its label, or the button whose file chooser is caught |
 | `browser_wait` | a delay, or until an element / text appears (or disappears), or the URL changes |
 | `browser_read` | the page's rendered text — cheap, no screenshot |
 | `browser_evaluate` | JavaScript in the page, result as JSON |
@@ -79,6 +92,7 @@ claude.ai ──HTTPS──▶ edge ──▶ chromemcp :8787
                                └─ sessions/
                                    ├─ s-…/profile/   Chrome --user-data-dir, --headless=new
                                    ├─ s-…/cookies.json
+                                   ├─ s-…/files/     what file_put put there, for a page's file picker
                                    └─ s-…/            Xvnc :N ◀── Chrome (headful) ◀── chrome-devtools-mcp
                                   identities/<name>/{profile/, cookies.json, identity.json}
 ```
@@ -121,6 +135,23 @@ claude.ai ──HTTPS──▶ edge ──▶ chromemcp :8787
   unix socket only (a loopback port when the path would be too long for a
   socket), and the bridge dials it per websocket. A connected viewer keeps
   the session from being parked.
+- **Uploads go through the file dialog, not around it.** `file_put` writes
+  the bytes into `sessions/s-…/files/` — inside the session directory, so
+  they are kept while it is parked and deleted with it, and `identity_save`,
+  which copies only the profile and the cookie jar, never carries one into
+  another session. `browser_upload` then hands them over with
+  `DOM.setFileInputFiles`, which fills the input exactly as a person
+  choosing the file does, `input` and `change` firing over a real `FileList`
+  — nothing a script in the page can construct. It finds the input behind
+  the widget (the element itself, a `<label>`'s control, an input nested in
+  a drop zone), and a hidden one is fine because no click is needed; where
+  the page has no input until its button is clicked, the chooser is
+  intercepted (`Page.setInterceptFileChooserDialog`, always turned off
+  again so a person at the live view still gets their own dialog) and the
+  input Chrome names in the event is filled instead. The answer reads back
+  what the input ended up holding, and says so when the file falls outside
+  the input's `accept` — which a site silently ignores, looking exactly
+  like nothing having happened.
 - **Dialogs are accepted** (alert/confirm/prompt/beforeunload) so a page never
   blocks on one nobody can see; the message is reported with the next result.
 
@@ -375,5 +406,10 @@ popup (where the platform hint on the popup's own first navigation is checked,
 the request-interception path), after a park and resume, and (with an Xvnc on
 PATH) headful, including the framed outer-window size and that the `fantasy`
 generic measures narrower than `system-ui`; and the `linux` profile's brand
-list against the algorithm. They skip themselves where there is no Chrome, as
-in the image's build stage; `CHROMEMCP_TEST_NO_CHROME=1` skips them anywhere.
+list against the algorithm; and `TestUploadIntegration` / `TestUploadTools`:
+the three shapes a site asks for a file in — a plain input, a hidden one
+behind its styled label, and a button that builds its input only when
+clicked — checked by what the page's own `change` handler reports, the
+second of the two over the MCP wire from `file_put` to `file_delete`. They
+skip themselves where there is no Chrome, as in the image's build stage;
+`CHROMEMCP_TEST_NO_CHROME=1` skips them anywhere.

@@ -21,6 +21,8 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/dom"
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/cdproto/runtime"
@@ -524,6 +526,139 @@ func downscale(src image.Image, scale float64) image.Image {
 		}
 	}
 	return dst
+}
+
+// ---- giving a page a file ----
+
+// fileChooserWait is how long a click is given to produce the file dialog
+// before the interception is called off.
+const fileChooserWait = 10 * time.Second
+
+// fileTargetInfo is the page's answer to "where would a file go?".
+type fileTargetInfo struct {
+	Error    string `json:"error"`
+	Mode     string `json:"mode"`     // "input": set it directly; "chooser": click it and catch the dialog
+	Selector string `json:"selector"` // how the input would be named again
+	Name     string `json:"name"`
+	Accept   string `json:"accept"`
+	Multiple bool   `json:"multiple"`
+	Hidden   bool   `json:"hidden"`
+	Disabled bool   `json:"disabled"`
+}
+
+func (f *fileTargetInfo) describe() string {
+	d := f.Selector
+	if d == "" {
+		d = "the file input"
+	}
+	if f.Name != "" {
+		d += " " + strconv.Quote(f.Name)
+	}
+	if f.Hidden {
+		d += " (hidden, as upload widgets usually are)"
+	}
+	return d
+}
+
+// findFileTarget asks the page what a file should be given to, and leaves
+// the element on window.__cmcpFileEl for setFilesOnElement.
+func findFileTarget(ctx context.Context, t *tab, spec targetSpec) (*fileTargetInfo, error) {
+	var info fileTargetInfo
+	if err := evalJSON(ctx, t, jsCall("fileTarget", spec), &info); err != nil {
+		return nil, fmt.Errorf("looking for the file input: %w", err)
+	}
+	if info.Error != "" {
+		return nil, errors.New(info.Error)
+	}
+	return &info, nil
+}
+
+// setFilesOnElement gives the files to the input the page left on
+// window.__cmcpFileEl. DOM.setFileInputFiles is the whole point: it fills
+// the input the way the file dialog does, firing input and change with a
+// real FileList behind them, which no script in the page can fake.
+func setFilesOnElement(ctx context.Context, t *tab, paths []string) error {
+	ectx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
+	defer cancel()
+	var obj *runtime.RemoteObject
+	if err := chromedp.Run(ectx, chromedp.Evaluate("window.__cmcpFileEl", &obj)); err != nil {
+		return err
+	}
+	if obj == nil || obj.ObjectID == "" {
+		return errors.New("the file input is no longer in the page — take a new browser_snapshot")
+	}
+	defer chromedp.Run(ectx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return runtime.ReleaseObject(obj.ObjectID).Do(ctx)
+	}))
+	return chromedp.Run(ectx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return dom.SetFileInputFiles(paths).WithObjectID(obj.ObjectID).Do(ctx)
+	}))
+}
+
+// setFilesViaChooser covers the widget that has no input to find until it
+// is clicked: the dialog is intercepted (so nothing opens on the display),
+// click is run, and the input Chrome names in the event is filled. The
+// interception is always turned off again — in a headful session a person
+// at the live view would otherwise find the picker silently swallowed.
+func setFilesViaChooser(ctx context.Context, t *tab, paths []string, click func() error) error {
+	ch := make(chan *page.EventFileChooserOpened, 1)
+	lctx, cancel := context.WithCancel(t.ctx)
+	defer cancel()
+	chromedp.ListenTarget(lctx, func(ev any) {
+		if e, ok := ev.(*page.EventFileChooserOpened); ok {
+			select {
+			case ch <- e:
+			default:
+			}
+		}
+	})
+	if err := chromedp.Run(t.ctx, page.SetInterceptFileChooserDialog(true)); err != nil {
+		return fmt.Errorf("intercepting the file chooser: %w", err)
+	}
+	defer chromedp.Run(t.ctx, page.SetInterceptFileChooserDialog(false))
+	if err := click(); err != nil {
+		return err
+	}
+	select {
+	case ev := <-ch:
+		if ev.BackendNodeID == 0 {
+			return errors.New("that opened a file picker of the File System Access API (showOpenFilePicker), not an <input type=file>; " +
+				"nothing can be handed to it from here")
+		}
+		ectx, ecancel := context.WithTimeout(t.ctx, 30*time.Second)
+		defer ecancel()
+		return chromedp.Run(ectx, chromedp.ActionFunc(func(ctx context.Context) error {
+			if err := dom.SetFileInputFiles(paths).WithBackendNodeID(ev.BackendNodeID).Do(ctx); err != nil {
+				return err
+			}
+			adoptFileNode(ctx, ev.BackendNodeID)
+			return nil
+		}))
+	case <-time.After(fileChooserWait):
+		return fmt.Errorf("clicking it opened no file chooser within %s; if the page has a plain <input type=file>, "+
+			"give that as the target instead", fileChooserWait)
+	}
+}
+
+// adoptFileNode puts the input Chrome reported on window.__cmcpFileEl, so
+// the read-back afterwards is the same for both routes. Best effort: it
+// only makes the answer nicer.
+func adoptFileNode(ctx context.Context, id cdp.BackendNodeID) {
+	obj, err := dom.ResolveNode().WithBackendNodeID(id).Do(ctx)
+	if err != nil || obj == nil || obj.ObjectID == "" {
+		return
+	}
+	defer runtime.ReleaseObject(obj.ObjectID).Do(ctx)
+	runtime.CallFunctionOn("function () { window.__cmcpFileEl = this; }").WithObjectID(obj.ObjectID).Do(ctx)
+}
+
+// fileInputContents is what the input holds now, as the page sees it.
+func fileInputContents(ctx context.Context, t *tab) []string {
+	var have []string
+	if err := evalJSON(ctx, t, jsCall("fileInputState"), &have); err != nil {
+		return nil
+	}
+	return have
 }
 
 // readText is the page's rendered text.

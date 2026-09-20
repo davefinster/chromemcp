@@ -17,7 +17,7 @@ import (
 
 // snapshotJS installs window.__cmcp and returns it. Idempotent per page.
 const snapshotJS = `(() => {
-if (window.__cmcp && window.__cmcp.v === 4) return window.__cmcp;
+if (window.__cmcp && window.__cmcp.v === 5) return window.__cmcp;
 const SEL = 'a[href], button, input, select, textarea, summary, details, label, [role], [contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"], [tabindex], [onclick], h1, h2, h3, h4, h5, h6, img[alt], [aria-label]';
 const SKIP_ROLES = new Set(['presentation', 'none', 'generic', 'document', 'group', 'list', 'listitem', 'table', 'row', 'cell', 'gridcell', 'columnheader', 'rowheader', 'rowgroup', 'region', 'main', 'navigation', 'banner', 'contentinfo', 'complementary', 'form', 'search', 'article', 'section', 'paragraph', 'img', 'figure', 'separator', 'toolbar', 'status', 'log', 'timer', 'marquee', 'tooltip', 'progressbar', 'application', 'feed', 'note', 'definition', 'term', 'directory', 'math', 'code', 'emphasis', 'strong', 'subscript', 'superscript', 'time', 'insertion', 'deletion', 'blockquote', 'caption', 'meter', 'tablist', 'menubar', 'menu', 'listbox', 'radiogroup', 'tree', 'treegrid', 'grid', 'dialog', 'alertdialog', 'alert', 'tabpanel', 'scrollbar']);
 
@@ -248,6 +248,64 @@ function selectOption(t, value) {
   el.dispatchEvent(new Event('change', {bubbles: true}));
   return {selected: clean(opt.text, 80), value: opt.value};
 }
+function fileInputsIn(doc) {
+  const out = [];
+  for (const el of walk(doc)) if (el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'file') out.push(el);
+  return out;
+}
+function allFileInputs() {
+  const out = fileInputsIn(document);
+  for (const f of document.querySelectorAll('iframe, frame')) {
+    try { if (f.contentDocument) out.push(...fileInputsIn(f.contentDocument)); } catch (e) {}
+  }
+  return out;
+}
+function describeInput(el) {
+  let where = 'input';
+  if (el.id) where += '#' + el.id;
+  else if (el.name) where += '[name=' + JSON.stringify(el.name) + ']';
+  return {tag: 'input', name: el.name || el.id || labelOf(el) || '', selector: where,
+          accept: el.getAttribute('accept') || '', multiple: !!el.multiple,
+          hidden: !visible(el), disabled: !!el.disabled};
+}
+// fileTarget finds what a file should be given to, and leaves the element
+// on window.__cmcpFileEl for the CDP side to set the files on — the input
+// itself where there is one (hidden or not: a picker is never really
+// clicked), and 'chooser' where the page builds its input only once the
+// button is clicked, which the caller then does with the dialog
+// intercepted.
+function fileTarget(t) {
+  window.__cmcpFileEl = null;
+  let el = null;
+  if (t && (t.ref || t.selector || t.text)) {
+    el = elementOf(t);
+    if (!el) return {error: 'no element matches that ref, selector or text — take a new browser_snapshot'};
+  }
+  if (el) {
+    let input = null;
+    if (el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'file') input = el;
+    else if (el.tagName === 'LABEL' && el.control && el.control.tagName === 'INPUT' && (el.control.type || '').toLowerCase() === 'file') input = el.control;
+    else if (el.querySelector) input = el.querySelector('input[type=file]');
+    if (input) { window.__cmcpFileEl = input; return Object.assign({mode: 'input'}, describeInput(input)); }
+    if (!visible(el)) return {error: 'that element is not a file input and cannot be clicked (it is hidden)'};
+    return {mode: 'chooser'};
+  }
+  const all = allFileInputs();
+  if (all.length === 0) return {error: 'this page has no <input type=file>; if it uploads through a button or a drop zone, ' +
+    'give that button as ref/selector/text and its file chooser will be caught'};
+  if (all.length > 1) return {error: 'this page has ' + all.length + ' file inputs — say which one, by selector or by ref ' +
+    '(browser_snapshot lists them with role "file"): ' +
+    all.map(describeInput).map(d => d.selector + (d.name ? ' ' + JSON.stringify(d.name) : '') + (d.hidden ? ' (hidden)' : '')).join(', ')};
+  window.__cmcpFileEl = all[0];
+  return Object.assign({mode: 'input'}, describeInput(all[0]));
+}
+// fileInputState reads back what the input ended up holding: the site's own
+// view of the upload, and the only proof the files landed.
+function fileInputState() {
+  const el = window.__cmcpFileEl;
+  if (!el || !el.files) return null;
+  return Array.from(el.files).map(f => f.name + ' (' + f.size + ' bytes' + (f.type ? ', ' + f.type : '') + ')');
+}
 function label(on) {
   const old = document.getElementById('__cmcp_labels');
   if (old) old.remove();
@@ -282,7 +340,7 @@ function readText(sel, max) {
   if (max && text.length > max) text = text.slice(0, max);
   return {url: location.href, title: document.title, text, total, truncated: total > text.length};
 }
-window.__cmcp = {v: 4, snapshot, resolve, clearField, selectOption, label, readText};
+window.__cmcp = {v: 5, snapshot, resolve, clearField, selectOption, label, readText, fileTarget, fileInputState};
 return window.__cmcp;
 })()`
 
@@ -333,7 +391,7 @@ func (r *snapResult) render(viewportFirst bool) string {
 		els = append([]snapElement(nil), els...)
 		sort.SliceStable(els, func(i, j int) bool { return els[i].InView && !els[j].InView })
 	}
-	offscreen := false
+	offscreen, files := false, false
 	for _, e := range els {
 		if viewportFirst && !e.InView && !offscreen {
 			sb.WriteString("\n-- below/above the viewport (scroll to reach) --\n")
@@ -341,6 +399,12 @@ func (r *snapResult) render(viewportFirst bool) string {
 		}
 		sb.WriteString(e.line())
 		sb.WriteByte('\n')
+		if e.Role == "file" {
+			files = true
+		}
+	}
+	if files {
+		sb.WriteString("\nthis page takes a file: file_put puts one on the session, browser_upload gives it to the input.\n")
 	}
 	return sb.String()
 }
@@ -351,7 +415,7 @@ func (e *snapElement) line() string {
 	if e.Role == "heading" && e.Level > 0 {
 		fmt.Fprintf(&sb, " h%d", e.Level)
 	}
-	if e.Type != "" && e.Type != "text" && e.Role != "checkbox" && e.Role != "radio" && e.Role != "button" {
+	if e.Type != "" && e.Type != "text" && e.Role != "checkbox" && e.Role != "radio" && e.Role != "button" && e.Role != "file" {
 		fmt.Fprintf(&sb, " (%s)", e.Type)
 	}
 	if e.Name != "" {
