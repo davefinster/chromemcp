@@ -332,7 +332,7 @@ func TestToolRegistry(t *testing.T) {
 	for _, want := range []string{
 		"session_start", "session_list", "session_resume", "session_stop", "session_delete", "session_view",
 		"identity_list", "identity_save", "identity_delete",
-		"file_put", "file_list", "file_delete",
+		"file_put", "file_list", "file_delete", "file_upload_url",
 		"browser_navigate", "browser_history", "browser_snapshot", "browser_screenshot", "browser_click", "browser_type",
 		"browser_press", "browser_hover", "browser_scroll", "browser_select", "browser_upload", "browser_wait", "browser_read",
 		"browser_evaluate", "browser_fingerprint", "browser_console", "browser_tabs", "browser_tab_new", "browser_tab_select", "browser_tab_close",
@@ -342,8 +342,8 @@ func TestToolRegistry(t *testing.T) {
 			t.Errorf("tool %s not registered", want)
 		}
 	}
-	if len(res.Tools) != 34 {
-		t.Errorf("%d tools, want 34", len(res.Tools))
+	if len(res.Tools) != 35 {
+		t.Errorf("%d tools, want 35", len(res.Tools))
 	}
 	// session_start advertises its closed-set arguments as enums on the wire,
 	// so a client sees the valid values without reading the prose.

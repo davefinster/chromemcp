@@ -43,11 +43,19 @@ screenshot. Most actions return a screenshot so you can see the result; pass
 screenshot=false when you only need the text. browser_read gives the page's text
 cheaply; browser_screenshot with labels=true overlays the refs on the picture.
 
-FILES: to give a site a file — an attachment, a photo, a spreadsheet — put the bytes on
-the session first with file_put (base64, or plain text), then browser_upload hands it to
-the page's file input, which is what a person choosing it in the file dialog does. Target
-the input, or the upload button whose file chooser is then caught. A session's files live
-and die with it; file_list shows what one holds.
+FILES: to give a site a file — an attachment, a photo, a spreadsheet — get it onto the
+session first, then browser_upload hands it to the page's file input, which is what a
+person choosing it in the file dialog does. Target the input, or the upload button whose
+file chooser is then caught. A session's files live and die with it; file_list shows what
+one holds.
+
+There are three roads onto a session, and file_put is the dearest of them: base64 in a
+tool call costs about 1.4 characters of context per byte, so keep it for small things.
+Anything the session can DOWNLOAD is free — Chrome saves it into the session and it
+appears in file_list ready to upload, so "fetch it from one site and give it to another"
+never touches your context at all. And when the file is on a person's machine,
+file_upload_url gives you a link to send them: they drop the file on the page, it lands
+on the session, and you carry on.
 
 devtools_tools / devtools_call pass a session through to Google's chrome-devtools-mcp
 (network requests, performance traces, emulation, and more) on the same Chrome.
@@ -82,9 +90,11 @@ func runMCP(ctx context.Context, app *mcpApp, httpAddr string, oauthCfg *oauthCo
 	// Unauthenticated on purpose: the edge's backend check and the kubelet
 	// probe carry no token. It reveals only liveness and counts.
 	mux.Handle("/healthz", app)
-	// The live view authenticates with its own short-lived token (view.go):
-	// a browser following a link cannot present the bearer token.
+	// The live view and the upload link authenticate with their own
+	// short-lived tokens (view.go, upload.go): a browser following a link,
+	// or a curl sending a file, cannot present the bearer token.
 	mux.Handle("/view/", views)
+	mux.Handle("/upload/", &uploadHandler{mgr: app.mgr})
 	mux.Handle("/", handler)
 	if oauthCfg != nil {
 		logf("Streamable HTTP on http://%s as OAuth resource %s (issuer %s)", httpAddr, oauthCfg.PublicURL, oauthCfg.Issuer)
@@ -207,6 +217,12 @@ type filePutIn struct {
 	Content   string `json:"content,omitempty" jsonschema:"the file's bytes, base64-encoded (a data: URL is accepted too). Use this for anything binary"`
 	Text      string `json:"text,omitempty" jsonschema:"the file's contents as plain text, instead of content, for a text file (csv, json, svg, txt…)"`
 	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"replace a file of that name the session already holds"`
+	Append    bool   `json:"append,omitempty" jsonschema:"add these bytes to the end of a file of that name instead of replacing it, creating it if there is none — the way to send something too big for one call, chunk by chunk. The file is only complete once the last chunk has landed"`
+}
+
+type uploadURLIn struct {
+	SessionID string `json:"session_id" jsonschema:"the session the files should land on"`
+	Name      string `json:"name,omitempty" jsonschema:"pin the link to this one file name; by default it takes any file, under the name the sender gives it"`
 }
 
 type fileNameIn struct {
@@ -217,7 +233,7 @@ type fileNameIn struct {
 type uploadIn struct {
 	tabIn
 	targetSpec
-	Files []string `json:"files" jsonschema:"names of files already put on this session with file_put, in the order the input should hold them"`
+	Files []string `json:"files" jsonschema:"names of files this session holds — file_list shows them, whether they were put there or downloaded — in the order the input should hold them"`
 }
 
 // tabIn is the common prefix of the browser tools.
@@ -435,18 +451,29 @@ func (a *mcpApp) register(s *mcp.Server) {
 		Name: "file_put",
 		Description: "Put a file on a session so a page can be given it later: send the bytes as base64 (content) or as plain text (text), " +
 			"under the name the site should see. browser_upload then hands it to a page's file picker. " +
-			"The file belongs to the session — it survives parking and is deleted with it, and never becomes part of an identity.",
+			"The file belongs to the session — it survives parking and is deleted with it, and never becomes part of an identity. " +
+			"Base64 is expensive, so this is the road for small files: anything the session can download is already free (it appears " +
+			"in file_list by itself), and file_upload_url is the road for a file on someone's machine.",
 		Annotations: acts("Put a file on a session"),
 	}, a.filePut)
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "file_list",
-		Description: "The files a session holds, with their sizes and the type a site will infer from each name.",
+		Name: "file_upload_url",
+		Description: "A link for sending files to this session over ordinary HTTP, for bytes you do not have and should not carry: " +
+			"give it to the owner and they drop the file on the page it serves, or use it from a shell (curl -T file URL/name). " +
+			"It is short-lived, works for one session, and whoever holds it can put files there — so send it to the owner, not to a page. " +
+			"What lands appears in file_list like anything else.",
+		Annotations: acts("Get an upload link"),
+	}, a.fileUploadURL)
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "file_list",
+		Description: "The files a session holds, with their sizes and the type a site will infer from each name — both the ones put there " +
+			"and the ones Chrome downloaded while the session browsed, which browser_upload can hand to a page just the same.",
 		Annotations: readOnly("List session files"),
 	}, a.fileList)
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "file_delete",
-		Description: "Delete one of a session's files. A page given the file holds a reference to it, not a copy, so delete it once the " +
-			"upload has gone through rather than before.",
+		Description: "Delete one of a session's files, put or downloaded. A page given the file holds a reference to it, not a copy, so " +
+			"delete it once the upload has gone through rather than before.",
 		Annotations: destructive("Delete a session file"),
 	}, a.fileDelete)
 
@@ -508,7 +535,8 @@ func (a *mcpApp) register(s *mcp.Server) {
 	}, a.selectOption)
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "browser_upload",
-		Description: "Give the page files from this session (file_put them first) exactly as a person choosing them in the file dialog would: " +
+		Description: "Give the page files from this session (file_list shows them: put there, or downloaded by the browser) exactly as a " +
+			"person choosing them in the file dialog would: " +
 			"the input is filled and the page's change handlers run. Target the file input by ref/selector/text — a hidden one behind a " +
 			"styled button is fine, it is never really clicked — or target the upload button itself and the file chooser it opens is caught. " +
 			"With no target, the page's only file input is used.",
@@ -797,6 +825,9 @@ func (a *mcpApp) filePut(ctx context.Context, req *mcp.CallToolRequest, in fileP
 	if in.Content != "" && in.Text != "" {
 		return nil, nil, errors.New("give the file as content (base64) or as text, not both")
 	}
+	if in.Overwrite && in.Append {
+		return nil, nil, errors.New("overwrite replaces the file and append adds to it; ask for one or the other")
+	}
 	var data []byte
 	switch {
 	case in.Content != "":
@@ -816,7 +847,14 @@ func (a *mcpApp) filePut(ctx context.Context, req *mcp.CallToolRequest, in fileP
 	}
 	// No Chrome needed, and none started: a parked session takes files too.
 	s.touch()
-	f, err := s.putFile(in.Name, data, in.Overwrite)
+	mode := putCreate
+	switch {
+	case in.Append:
+		mode = putAppend
+	case in.Overwrite:
+		mode = putOverwrite
+	}
+	f, err := s.putFile(in.Name, data, mode)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -824,6 +862,11 @@ func (a *mcpApp) filePut(ctx context.Context, req *mcp.CallToolRequest, in fileP
 	typ := ""
 	if f.MIME != "" {
 		typ = ", " + f.MIME
+	}
+	if mode == putAppend {
+		r.addf("added %s to %q on session %s, now %s%s", humanBytes(int64(len(data))), f.Name, s.meta.ID, humanBytes(f.Size), typ)
+		r.addf("the file is whatever has arrived so far; send the next chunk with append=true, and upload it once the last one has landed")
+		return text(strings.Join(r.lines, "\n")), nil, nil
 	}
 	r.addf("put %q on session %s (%s%s)", f.Name, s.meta.ID, humanBytes(f.Size), typ)
 	if f.MIME == "" {
@@ -844,15 +887,85 @@ func (a *mcpApp) fileList(ctx context.Context, req *mcp.CallToolRequest, in sess
 		return nil, nil, err
 	}
 	if len(files) == 0 {
-		return text(fmt.Sprintf("session %s holds no files; file_put adds one for a page's file picker", s.meta.ID)), nil, nil
+		return text(fmt.Sprintf("session %s holds no files. file_put puts one there for a page's file picker, file_upload_url gets a "+
+			"link for sending one in, and anything the browser downloads lands here by itself.", s.meta.ID)), nil, nil
+	}
+	put, err := s.listPutFiles()
+	if err != nil {
+		return nil, nil, err
 	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "session %s holds %d files (%s of the %s it may):\n", s.meta.ID, len(files), humanBytes(s.filesTotal(files)), humanBytes(maxSessionFileBytes))
+	fmt.Fprintf(&sb, "session %s holds %d files:\n", s.meta.ID, len(files))
 	for _, f := range files {
-		fmt.Fprintf(&sb, "- %s, put %s\n", f, f.Modified.Format("Jan 2 15:04"))
+		switch {
+		case f.Partial:
+			fmt.Fprintf(&sb, "- %s — still downloading, %s so far\n", f.Name, humanBytes(f.Size))
+		case f.Downloaded:
+			fmt.Fprintf(&sb, "- %s, downloaded %s\n", f, f.Modified.Format("Jan 2 15:04"))
+		default:
+			fmt.Fprintf(&sb, "- %s, put %s\n", f, f.Modified.Format("Jan 2 15:04"))
+		}
+	}
+	fmt.Fprintf(&sb, "%s of the %s a session may be given; downloads are the browser's own and are not counted.\n",
+		humanBytes(s.filesTotal(put)), humanBytes(maxSessionFileBytes))
+	if shadowed := shadowedDownloads(s, put); len(shadowed) > 0 {
+		fmt.Fprintf(&sb, "note: %s was also downloaded, and the put file of that name is what you get; delete it to reach the download.\n",
+			strings.Join(quoteAll(shadowed), ", "))
 	}
 	sb.WriteString("browser_upload gives them to a page's file input; they go when the session does.")
 	return text(sb.String()), nil, nil
+}
+
+// shadowedDownloads names the downloads a put file of the same name hides,
+// so a file the browser fetched is never simply missing from a listing.
+func shadowedDownloads(s *session, put []sessionFile) []string {
+	downloads, err := s.listDownloads()
+	if err != nil || len(downloads) == 0 {
+		return nil
+	}
+	taken := make(map[string]bool, len(put))
+	for _, f := range put {
+		taken[f.Name] = true
+	}
+	var out []string
+	for _, f := range downloads {
+		if taken[f.Name] {
+			out = append(out, f.Name)
+		}
+	}
+	return out
+}
+
+func (a *mcpApp) fileUploadURL(ctx context.Context, req *mcp.CallToolRequest, in uploadURLIn) (*mcp.CallToolResult, any, error) {
+	if a.mgr.cfg.ViewBase == "" {
+		return nil, nil, errors.New("upload links need the HTTP transport (serve -http); there is no URL to give out over stdio")
+	}
+	s, err := a.mgr.get(in.SessionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if in.Name != "" {
+		if err := checkFileName(in.Name); err != nil {
+			return nil, nil, err
+		}
+	}
+	// A parked session takes files as happily as a running one, so nothing
+	// is started here.
+	s.touch()
+	tok, exp := a.mgr.uploads.issue(s.meta.ID, in.Name)
+	u := fmt.Sprintf("%s/upload/%s/", a.mgr.cfg.ViewBase, tok)
+	r := &result{}
+	r.addf("Upload link for session %s (valid until %s, %s from now):", s.meta.ID, exp.Format(time.RFC3339), time.Until(exp).Round(time.Minute))
+	r.addf("%s", u)
+	r.addf("")
+	if in.Name != "" {
+		r.addf("Opening it gives a page to drop %q on. From a shell: curl -T <file> %s%s", in.Name, u, in.Name)
+	} else {
+		r.addf("Opening it gives a page to drop files on. From a shell: curl -T report.pdf %sreport.pdf", u)
+	}
+	r.addf("Up to %s a file. What lands shows up in file_list, and browser_upload hands it to a page.", humanBytes(maxFileBytes))
+	r.addf("Anyone with the link can put files on this session until it expires, so give it to the owner rather than to a site.")
+	return text(strings.Join(r.lines, "\n")), nil, nil
 }
 
 func (a *mcpApp) fileDelete(ctx context.Context, req *mcp.CallToolRequest, in fileNameIn) (*mcp.CallToolResult, any, error) {

@@ -111,27 +111,27 @@ func TestSessionFileStore(t *testing.T) {
 		t.Errorf("filePaths on an empty session: %v", err)
 	}
 
-	f, err := s.putFile("rows.csv", []byte("a,b\n1,2\n"), false)
+	f, err := s.putFile("rows.csv", []byte("a,b\n1,2\n"), putCreate)
 	if err != nil || f.Size != 8 || f.MIME != "text/csv" {
 		t.Fatalf("putFile: %+v %v", f, err)
 	}
-	if _, err := s.putFile("rows.csv", []byte("x"), false); err == nil || !strings.Contains(err.Error(), "overwrite=true") {
+	if _, err := s.putFile("rows.csv", []byte("x"), putCreate); err == nil || !strings.Contains(err.Error(), "overwrite=true") {
 		t.Errorf("second put without overwrite: %v", err)
 	}
-	if _, err := s.putFile("rows.csv", []byte("x"), true); err != nil {
+	if _, err := s.putFile("rows.csv", []byte("x"), putOverwrite); err != nil {
 		t.Errorf("overwrite: %v", err)
 	}
-	if _, err := s.putFile("bad/name.csv", []byte("x"), false); err == nil {
+	if _, err := s.putFile("bad/name.csv", []byte("x"), putCreate); err == nil {
 		t.Error("a name with a separator was accepted")
 	}
-	if _, err := s.putFile("empty.txt", nil, false); err == nil {
+	if _, err := s.putFile("empty.txt", nil, putCreate); err == nil {
 		t.Error("an empty file was accepted")
 	}
-	if _, err := s.putFile("huge.bin", make([]byte, maxFileBytes+1), false); err == nil {
+	if _, err := s.putFile("huge.bin", make([]byte, maxFileBytes+1), putCreate); err == nil {
 		t.Error("a file over the per-file limit was accepted")
 	}
 
-	if _, err := s.putFile("photo.jpg", []byte{0xff, 0xd8, 0xff}, false); err != nil {
+	if _, err := s.putFile("photo.jpg", []byte{0xff, 0xd8, 0xff}, putCreate); err != nil {
 		t.Fatal(err)
 	}
 	files, err := s.listFiles()
@@ -184,15 +184,15 @@ func TestSessionFileStore(t *testing.T) {
 func TestSessionFileCounts(t *testing.T) {
 	s := testSession(t)
 	for i := 0; i < maxSessionFiles; i++ {
-		if _, err := s.putFile(fmt.Sprintf("f%d.txt", i), []byte("x"), false); err != nil {
+		if _, err := s.putFile(fmt.Sprintf("f%d.txt", i), []byte("x"), putCreate); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
-	if _, err := s.putFile("one-too-many.txt", []byte("x"), false); err == nil {
+	if _, err := s.putFile("one-too-many.txt", []byte("x"), putCreate); err == nil {
 		t.Error("the file-count limit was not enforced")
 	}
 	// Replacing one of the files it already holds is not one more file.
-	if _, err := s.putFile("f0.txt", []byte("yy"), true); err != nil {
+	if _, err := s.putFile("f0.txt", []byte("yy"), putOverwrite); err != nil {
 		t.Errorf("overwrite at the count limit: %v", err)
 	}
 }
@@ -216,7 +216,7 @@ func TestSessionFilesFollowTheSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	mgr.sessions[s.meta.ID] = s
-	if _, err := s.putFile("secret.pdf", []byte("%PDF-1.4 hello"), false); err != nil {
+	if _, err := s.putFile("secret.pdf", []byte("%PDF-1.4 hello"), putCreate); err != nil {
 		t.Fatal(err)
 	}
 
@@ -279,12 +279,12 @@ func TestUploadIntegration(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	sid := s.meta.ID
-	if _, err := s.putFile("rows.csv", []byte("a,b\n1,2\n"), false); err != nil {
+	if _, err := s.putFile("rows.csv", []byte("a,b\n1,2\n"), putCreate); err != nil {
 		t.Fatal(err)
 	}
 	// A one-pixel PNG, so the page gets something a real image type.
 	png, _ := decodeFileContent("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
-	if _, err := s.putFile("pixel.png", png, false); err != nil {
+	if _, err := s.putFile("pixel.png", png, putCreate); err != nil {
 		t.Fatal(err)
 	}
 
@@ -493,4 +493,170 @@ func TestUploadTools(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "files")); !os.IsNotExist(err) {
 		t.Errorf("the session's files outlived it: %v", err)
 	}
+}
+
+// Appending is how a file too big for one tool call arrives: chunk by
+// chunk onto the same name, complete only once the last one has landed.
+func TestSessionFileAppend(t *testing.T) {
+	s := testSession(t)
+
+	// The first chunk creates the file: there is nothing to add to yet.
+	if f, err := s.putFile("big.txt", []byte("one "), putAppend); err != nil || f.Size != 4 {
+		t.Fatalf("first chunk: %+v %v", f, err)
+	}
+	f, err := s.putFile("big.txt", []byte("two "), putAppend)
+	if err != nil || f.Size != 8 {
+		t.Fatalf("second chunk: %+v %v", f, err)
+	}
+	if f, err := s.putFile("big.txt", []byte("three"), putAppend); err != nil || f.Size != 13 {
+		t.Fatalf("third chunk: %+v %v", f, err)
+	}
+	got, err := os.ReadFile(filepath.Join(s.filesDir(), "big.txt"))
+	if err != nil || string(got) != "one two three" {
+		t.Fatalf("the chunks did not accumulate: %q %v", got, err)
+	}
+	// The count limit counts the file once, however many chunks built it.
+	if files, _ := s.listFiles(); len(files) != 1 {
+		t.Errorf("appending made %d files", len(files))
+	}
+
+	// A chunk that would pass the per-file limit leaves the file exactly
+	// as long as it was, rather than half-written.
+	if _, err := s.putFile("big.txt", make([]byte, maxFileBytes), putAppend); err == nil {
+		t.Error("an append over the per-file limit was accepted")
+	}
+	if fi, err := os.Stat(filepath.Join(s.filesDir(), "big.txt")); err != nil || fi.Size() != 13 {
+		t.Errorf("the refused chunk changed the file: %v %v", fi, err)
+	}
+	// And one that fails while creating leaves nothing behind at all.
+	if _, err := s.putFile("toobig.bin", make([]byte, maxFileBytes+1), putAppend); err == nil {
+		t.Error("an oversize first chunk was accepted")
+	}
+	if _, err := os.Stat(filepath.Join(s.filesDir(), "toobig.bin")); !os.IsNotExist(err) {
+		t.Errorf("a refused first chunk left the file behind: %v", err)
+	}
+	if _, err := s.putFile("empty.txt", nil, putAppend); err == nil {
+		t.Error("an empty chunk was accepted")
+	}
+}
+
+// What Chrome downloads is a session file like any other — the whole point
+// being that those bytes never pass through an agent's context.
+func TestSessionDownloadsAreFiles(t *testing.T) {
+	s := testSession(t)
+	if err := os.MkdirAll(s.downloadsDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(dir, name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(s.downloadsDir(), "invoice.pdf", "%PDF-1.4 downloaded")
+	write(s.downloadsDir(), "big.zip.crdownload", "half of it")
+	write(s.downloadsDir(), ".com.google.Chrome.tmp", "chrome's own")
+	if _, err := s.putFile("notes.txt", []byte("mine"), putCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := s.listFiles()
+	if err != nil || len(files) != 3 {
+		t.Fatalf("listFiles: %+v %v", files, err)
+	}
+	byName := map[string]sessionFile{}
+	for _, f := range files {
+		byName[f.Name] = f
+	}
+	if f := byName["invoice.pdf"]; !f.Downloaded || f.Partial || f.MIME != "application/pdf" {
+		t.Errorf("the download: %+v", f)
+	}
+	if f := byName["notes.txt"]; f.Downloaded {
+		t.Errorf("the put file came back as a download: %+v", f)
+	}
+	// A download still arriving is listed under the name it will have, and
+	// is not handed to a page half-written.
+	if f := byName["big.zip"]; !f.Partial {
+		t.Errorf("the part file: %+v", f)
+	}
+	if _, err := s.filePaths([]string{"big.zip"}); err == nil || !strings.Contains(err.Error(), "still downloading") {
+		t.Errorf("filePaths on a part file: %v", err)
+	}
+
+	// Downloads are Chrome's, not the agent's, so they are not metered.
+	put, _ := s.listPutFiles()
+	if got := s.filesTotal(put); got != 4 {
+		t.Errorf("filesTotal over put files = %d, want 4", got)
+	}
+
+	// browser_upload reaches a download by name, from the downloads dir.
+	paths, err := s.filePaths([]string{"invoice.pdf", "notes.txt"})
+	if err != nil || len(paths) != 2 {
+		t.Fatalf("filePaths: %v %v", paths, err)
+	}
+	if filepath.Dir(paths[0]) != mustAbs(t, s.downloadsDir()) || filepath.Dir(paths[1]) != mustAbs(t, s.filesDir()) {
+		t.Errorf("paths came from the wrong directories: %v", paths)
+	}
+
+	// Once the download finishes, the part file no longer doubles it.
+	write(s.downloadsDir(), "big.zip", "all of it")
+	files, _ = s.listFiles()
+	if len(files) != 3 {
+		t.Errorf("the finished download and its part file were both listed: %+v", files)
+	}
+	if f := findFile(files, "big.zip"); f == nil || f.Partial {
+		t.Errorf("after finishing: %+v", f)
+	}
+
+	// A put file of the same name wins, and the listing says the download
+	// is there rather than letting it vanish.
+	if _, err := s.putFile("invoice.pdf", []byte("mine, not theirs"), putCreate); err != nil {
+		t.Fatal(err)
+	}
+	files, _ = s.listFiles()
+	if f := findFile(files, "invoice.pdf"); f == nil || f.Downloaded {
+		t.Errorf("the put file did not win: %+v", f)
+	}
+	if shadowed := shadowedDownloads(s, mustPut(t, s)); len(shadowed) != 1 || shadowed[0] != "invoice.pdf" {
+		t.Errorf("shadowedDownloads = %v", shadowed)
+	}
+
+	// Deleting reaches either directory, and only through the listing, so
+	// a name that is not in it cannot name a path.
+	if err := s.deleteFile("big.zip"); err != nil {
+		t.Errorf("deleting a download: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.downloadsDir(), "big.zip")); !os.IsNotExist(err) {
+		t.Error("the download survived file_delete")
+	}
+	if err := s.deleteFile("../../etc/passwd"); err == nil {
+		t.Error("deleteFile accepted a path")
+	}
+}
+
+func mustAbs(t *testing.T, p string) string {
+	t.Helper()
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return abs
+}
+
+func mustPut(t *testing.T, s *session) []sessionFile {
+	t.Helper()
+	put, err := s.listPutFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return put
+}
+
+func findFile(files []sessionFile, name string) *sessionFile {
+	for i, f := range files {
+		if f.Name == name {
+			return &files[i]
+		}
+	}
+	return nil
 }

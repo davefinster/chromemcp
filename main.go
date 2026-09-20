@@ -173,7 +173,7 @@ func serve(args []string) int {
 		issuer   = fs.String("oauth-issuer", env("CHROMEMCP_OAUTH_ISSUER", ""), "OAuth authorization server issuer URL (e.g. https://xyz.authkit.app); enables bearer-token auth")
 		public   = fs.String("public-url", env("CHROMEMCP_PUBLIC_URL", ""), "canonical public URL of this server; the OAuth resource identifier tokens must be addressed to, and the base of live-view links")
 		emailPin = fs.String("allowed-email", env("CHROMEMCP_ALLOWED_EMAIL", ""), "only accept tokens whose email claim matches this address")
-		viewBase = fs.String("view-url", env("CHROMEMCP_VIEW_URL", ""), "base URL for live-view links when it differs from -public-url (default: -public-url, else http://<-http>)")
+		viewBase = fs.String("view-url", env("CHROMEMCP_VIEW_URL", ""), "base URL for live-view and upload links when it differs from -public-url (default: -public-url, else http://<-http>)")
 
 		sessionsDir   = fs.String("sessions-dir", env("CHROMEMCP_SESSIONS_DIR", filepath.Join(os.TempDir(), "chromemcp-sessions")), "where session profiles live; ephemeral by design (env CHROMEMCP_SESSIONS_DIR)")
 		identitiesDir = fs.String("identities-dir", env("CHROMEMCP_IDENTITIES_DIR", defaultIdentitiesDir()), "where saved identities (logged-in profile snapshots) persist (env CHROMEMCP_IDENTITIES_DIR)")
@@ -190,6 +190,7 @@ func serve(args []string) int {
 		maxAge     = fs.Duration("max-age", envDuration("CHROMEMCP_MAX_AGE", 24*time.Hour), "delete sessions not used for this long (0 disables)")
 		maxRunning = fs.Int("max-running", envInt("CHROMEMCP_MAX_RUNNING", 6), "most Chrome instances alive at once; the least recently used is parked to make room")
 		viewTTL    = fs.Duration("view-ttl", envDuration("CHROMEMCP_VIEW_TTL", 30*time.Minute), "how long a live-view link stays valid")
+		uploadTTL  = fs.Duration("upload-ttl", envDuration("CHROMEMCP_UPLOAD_TTL", time.Hour), "how long an upload link stays valid")
 		verbose    = fs.Bool("verbose", false, "log the MCP SDK and Chrome's stderr chatter")
 	)
 	fs.Var(&chromeFlags, "chrome-flag", "extra Chrome command-line flag (repeatable; env CHROMEMCP_CHROME_FLAGS, space-separated)")
@@ -248,6 +249,7 @@ func serve(args []string) int {
 		MaxAge:        *maxAge,
 		MaxRunning:    *maxRunning,
 		ViewTTL:       *viewTTL,
+		UploadTTL:     *uploadTTL,
 		ViewBase:      strings.TrimSuffix(base, "/"),
 		Verbose:       *verbose,
 	})

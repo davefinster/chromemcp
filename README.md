@@ -38,17 +38,30 @@ One Go binary, four parts:
 | `identity_save` | snapshot a session's profile and cookie jar under a name (Chrome is closed cleanly around the copy and started again) |
 | `identity_delete` | remove one |
 
-**Session files** — bytes the agent puts on a session for a page to be given
-later, deleted with it
+**Session files** — bytes a page can be given through its file picker,
+deleted with the session
 
 | tool | purpose |
 |---|---|
-| `file_put` | write a file onto a session: `content` (base64, or a `data:` URL) or `text`, under the `name` the site should see; `overwrite` replaces one |
-| `file_list` | what a session holds, with sizes and the type each name implies |
+| `file_put` | write a file onto a session: `content` (base64, or a `data:` URL) or `text`, under the `name` the site should see; `overwrite` replaces one, `append` adds to the end of one |
+| `file_upload_url` | a short-lived link that takes files over plain HTTP — a page to drop them on, or `curl -T`; `name` pins it to one file |
+| `file_list` | what a session holds, put or downloaded, with sizes and the type each name implies |
 | `file_delete` | remove one — after the upload has gone through: a page given a file holds a reference to it, not a copy |
 
-Up to 20 MB a file and 100 MB (or 50 files) a session — the bytes travel in
-the tool call, so a large file is a large request.
+Up to 20 MB a file and 100 MB (or 50 files) a session. There are three ways
+in, and they cost very different amounts:
+
+- **the browser downloads it** — free. Chrome saves what a session downloads
+  into the session, where `file_list` shows it and `browser_upload` hands it
+  to the next site. Fetching a file from one page and giving it to another
+  puts none of it through the agent's context.
+- **`file_upload_url`** — free, and the answer when the file is on a
+  person's machine: send them the link, they drop the file on the page it
+  serves. `curl -T report.pdf <link>report.pdf` does the same from a shell.
+- **`file_put`** — base64 inside the tool call, about 1.4 characters of
+  context per byte, paid on the way in and again on every turn that
+  transcript survives. Right for something small, wrong for a photo.
+  `append` sends one in chunks when there is no other road.
 
 **Browser** (every tool takes `session_id`, optionally `tab`; most return a
 screenshot, `screenshot=false` turns it off)
@@ -61,7 +74,7 @@ screenshot, `screenshot=false` turns it off)
 | `browser_click`, `browser_hover` | by ref, visible text, CSS selector, or viewport coordinates; real mouse events |
 | `browser_type`, `browser_press`, `browser_select` | type into a field (optionally clear, submit); press keys with modifiers; choose a `<select>` option |
 | `browser_scroll` | wheel-scroll the page, or bring an element into view |
-| `browser_upload` | give the page files from the session (`file_put` them first) as the file dialog would — the input itself, a hidden one behind its label, or the button whose file chooser is caught |
+| `browser_upload` | give the page files from the session (`file_list` shows them, put or downloaded) as the file dialog would — the input itself, a hidden one behind its label, or the button whose file chooser is caught |
 | `browser_wait` | a delay, or until an element / text appears (or disappears), or the URL changes |
 | `browser_read` | the page's rendered text — cheap, no screenshot |
 | `browser_evaluate` | JavaScript in the page, result as JSON |
@@ -88,11 +101,13 @@ DevTools port, and it dies with the session.
 claude.ai ──HTTPS──▶ edge ──▶ chromemcp :8787
                                ├─ /             MCP + OAuth
                                ├─ /view/<tok>/  noVNC + websocket ⇄ Xvnc   (headful sessions)
+                               ├─ /upload/<tok>/ drop page + PUT/POST → sessions/s-…/files/
                                ├─ /healthz
                                └─ sessions/
                                    ├─ s-…/profile/   Chrome --user-data-dir, --headless=new
                                    ├─ s-…/cookies.json
-                                   ├─ s-…/files/     what file_put put there, for a page's file picker
+                                   ├─ s-…/files/     what was put there, for a page's file picker
+                                   ├─ s-…/downloads/ what Chrome downloaded, offered the same way
                                    └─ s-…/            Xvnc :N ◀── Chrome (headful) ◀── chrome-devtools-mcp
                                   identities/<name>/{profile/, cookies.json, identity.json}
 ```
@@ -135,11 +150,28 @@ claude.ai ──HTTPS──▶ edge ──▶ chromemcp :8787
   unix socket only (a loopback port when the path would be too long for a
   socket), and the bridge dials it per websocket. A connected viewer keeps
   the session from being parked.
-- **Uploads go through the file dialog, not around it.** `file_put` writes
-  the bytes into `sessions/s-…/files/` — inside the session directory, so
-  they are kept while it is parked and deleted with it, and `identity_save`,
-  which copies only the profile and the cookie jar, never carries one into
-  another session. `browser_upload` then hands them over with
+- **The upload link is the same idea for bytes.** `file_upload_url` mints a
+  token of its own — separate from the view tokens, so a link that lets
+  someone watch a browser is not a link that lets them put files in it —
+  and `/upload/<tok>/` serves a self-contained drop page (inline style and
+  script under a nonce, `default-src 'none'`) that `PUT`s each file with an
+  `XMLHttpRequest`. `curl -T file <link>name` and `curl -F` reach the same
+  handler, which streams straight to disk and enforces the size limits
+  against the stream rather than after buffering it. A file replaces one of
+  that name, because a transfer that has to be repeated should not have to
+  be renamed. Links last `-upload-ttl` (an hour), survive parking — a
+  parked session takes files perfectly well — and die with the session.
+- **Uploads go through the file dialog, not around it.** The bytes land in
+  `sessions/s-…/files/` — inside the session directory, so they are kept
+  while it is parked and deleted with it, and `identity_save`, which copies
+  only the profile and the cookie jar, never carries one into another
+  session. `sessions/s-…/downloads/` is where Chrome has always put what a
+  session downloads, and a listing merges the two: to the page being handed
+  a file there is no difference, so a download is uploadable without
+  anything having to read it. A name held on both sides resolves to the put
+  file, and the listing says the download is there rather than letting it
+  disappear. A download still arriving (Chrome's `.crdownload`) is listed
+  under the name it will have and refused until it is finished. `browser_upload` then hands them over with
   `DOM.setFileInputFiles`, which fills the input exactly as a person
   choosing the file does, `input` and `change` firing over a real `FileList`
   — nothing a script in the page can construct. It finds the input behind
@@ -327,6 +359,7 @@ matter:
 | `-viewport` | `CHROMEMCP_VIEWPORT` | `1280x800` |
 | `-idle-park`, `-max-age`, `-max-running` | `CHROMEMCP_IDLE_PARK`, … | 30m, 24h, 6 |
 | `-view-ttl`, `-view-url` | `CHROMEMCP_VIEW_TTL`, `CHROMEMCP_VIEW_URL` | 30m; `-public-url` |
+| `-upload-ttl` | `CHROMEMCP_UPLOAD_TTL` | 1h (upload links; they share `-view-url`) |
 
 `GET /healthz` is unauthenticated and reports the version, the session
 counts, and whether headful sessions and the passthrough are available.
@@ -410,6 +443,9 @@ list against the algorithm; and `TestUploadIntegration` / `TestUploadTools`:
 the three shapes a site asks for a file in — a plain input, a hidden one
 behind its styled label, and a button that builds its input only when
 clicked — checked by what the page's own `change` handler reports, the
-second of the two over the MCP wire from `file_put` to `file_delete`. They
+second of the two over the MCP wire from `file_put` to `file_delete`; and
+`TestDropPageInChrome`, which opens the upload link's own page in a session
+and chooses a file through it, because that page's JavaScript only ever runs
+in a browser. They
 skip themselves where there is no Chrome, as in the image's build stage;
 `CHROMEMCP_TEST_NO_CHROME=1` skips them anywhere.

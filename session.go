@@ -61,7 +61,8 @@ type managerConfig struct {
 	MaxAge        time.Duration
 	MaxRunning    int
 	ViewTTL       time.Duration
-	ViewBase      string
+	UploadTTL     time.Duration
+	ViewBase      string // base URL for the links this server hands out: live views and uploads
 	Verbose       bool
 }
 
@@ -153,6 +154,7 @@ type manager struct {
 	cfg        *managerConfig
 	identities *identityStore
 	views      *viewTokens
+	uploads    *uploadTokens
 
 	mu       sync.Mutex
 	sessions map[string]*session
@@ -199,7 +201,11 @@ func newManager(cfg *managerConfig) (*manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &manager{cfg: cfg, identities: ids, views: newViewTokens(cfg.ViewTTL), sessions: map[string]*session{}}
+	m := &manager{
+		cfg: cfg, identities: ids, sessions: map[string]*session{},
+		views:   newViewTokens(cfg.ViewTTL),
+		uploads: newUploadTokens(cfg.UploadTTL),
+	}
 	m.loadParked()
 	return m, nil
 }
@@ -443,6 +449,7 @@ func (m *manager) remove(id string) error {
 	delete(m.sessions, id)
 	m.mu.Unlock()
 	m.views.revokeSession(id)
+	m.uploads.revokeSession(id)
 	if err := os.RemoveAll(s.dir); err != nil {
 		return err
 	}
