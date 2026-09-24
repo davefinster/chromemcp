@@ -5,7 +5,7 @@
 #            ghcr.io/davefinster/chromemcp serve -http :8787
 
 # ---- the Go server ---------------------------------------------------------
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine AS build
 ENV CGO_ENABLED=0
 WORKDIR /src
 COPY go.mod go.sum ./
