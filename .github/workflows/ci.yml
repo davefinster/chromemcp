@@ -1,0 +1,63 @@
+# What a pull request gets. The docker workflow only runs on push to main,
+# so without this a contribution would be merged unbuilt — and Dependabot's
+# own pull requests would arrive with nothing checking them.
+#
+# The trigger is `pull_request`, never `pull_request_target`: the latter
+# runs the BASE branch's workflows against a fork's code with a writable
+# token and access to secrets, which is the classic way a public repository
+# leaks. On `pull_request` a fork runs with a read-only token and no
+# secrets, which is why nothing here logs in or pushes anywhere.
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# A second push to a pull request makes the first run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+      - run: go vet ./...
+      - name: go test
+        # The integration tests drive a real Chrome against the image's own
+        # fonts and an Xvnc, neither of which a bare runner has — the device
+        # profile would be measured against the wrong machine. They run in
+        # the image build instead, which is what the `image` job exercises.
+        env:
+          CHROMEMCP_TEST_NO_CHROME: "1"
+        run: go test ./...
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build (no push)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          # Reads the cache the main branch filled and writes none of its
+          # own: a pull request should not be able to put anything into the
+          # cache that a later build on main would pick up.
+          cache-from: type=gha,scope=linux/amd64
