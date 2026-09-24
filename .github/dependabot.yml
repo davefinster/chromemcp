@@ -1,0 +1,47 @@
+# What keeps the pins in docker.yml from going stale.
+#
+# The workflow's actions are pinned to a commit rather than a tag, so
+# nothing about them floats: without this file they would stay frozen at
+# the commit they were pinned to, security fixes included. Dependabot
+# rewrites both the commit and the `# vX.Y.Z` comment beside it, which is
+# the whole reason that comment is there.
+#
+# Each ecosystem is grouped into a single pull request, because the point
+# is to be told that something moved, not to review three bumps
+# separately. Note that this repository runs no checks on pull requests —
+# the docker workflow builds on push to main — so a Dependabot pull
+# request arrives unverified and is worth a local build before merging.
+version: 2
+updates:
+  # The pinned actions in .github/workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    open-pull-requests-limit: 3
+
+  # chromedp, the MCP SDK and the websocket library. Security fixes come
+  # through Dependabot alerts whatever this says; this is for keeping up
+  # with releases that are not security fixes.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go:
+        patterns: ["*"]
+    open-pull-requests-limit: 3
+
+  # The image's two bases, golang:1.26-alpine and debian:trixie-slim. Both
+  # tags already float, so they collect patches on every rebuild without
+  # help; what this catches is the deliberate move — a new Go minor, a new
+  # Debian release — which is a decision rather than an upgrade. Drop this
+  # entry if the notification is not worth the pull request.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
