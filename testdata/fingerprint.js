@@ -63,7 +63,8 @@
   const generic = ['monospace', 'sans-serif', 'serif'];
   const base = generic.map(measure);
   for (const f of ['Segoe UI', 'Calibri', 'Cambria', 'Consolas', 'Tahoma', 'Verdana', 'Arial', 'Times New Roman',
-                   'Courier New', 'Helvetica Neue', 'DejaVu Sans', 'Liberation Sans', 'Noto Sans', 'Roboto', 'Ubuntu']) {
+                   'Courier New', 'Helvetica Neue', 'DejaVu Sans', 'DejaVu Serif', 'Liberation Sans', 'Noto Sans',
+                   'Selawik', 'Carlito', 'Roboto', 'Ubuntu']) {
     out.fonts[f] = generic.some((g, i) => measure('"' + f + '", ' + g) !== base[i]);
   }
   // The CSS generic families' own metrics: scripts read these to tell one

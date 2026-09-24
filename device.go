@@ -65,14 +65,15 @@ type deviceProfile struct {
 	Pointer string
 	// WebGL unmasked vendor and renderer (WEBGL_debug_renderer_info).
 	WebGLVendor, WebGLRenderer string
-	// FontsConf, when set, is the fontconfig configuration Chrome runs
-	// with: the machine's fonts under the device's family names (fonts.go).
-	FontsConf func(installed map[string]bool) string
+	// FontsPlan, when set, is the font world Chrome runs in: the machine's
+	// fonts, linked into a directory of the profile's own and renamed to
+	// the device's family names (fonts.go).
+	FontsPlan func(fonts *fontSet, fontDir, cacheDir string) fontPlan
 	// FontFamilies are the default fonts Blink resolves the CSS generic
 	// families to (standard, serif, sansserif, fixed, cursive, fantasy),
 	// as the Windows names Chrome uses there — so their metrics, which
 	// fingerprinting scripts read off the generics, look like Windows and
-	// not the Linux fallbacks. Resolved to stand-ins by FontsConf.
+	// not the Linux fallbacks. Backed by real files through FontsPlan.
 	FontFamilies map[string]string
 }
 
@@ -118,7 +119,7 @@ var deviceProfiles = map[string]*deviceProfile{
 		Pointer:             "fine",
 		WebGLVendor:         "Google Inc. (NVIDIA)",
 		WebGLRenderer:       "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002504) Direct3D11 vs_5_0 ps_5_0, D3D11)",
-		FontsConf:           windowsFontsConf,
+		FontsPlan:           windowsFontsPlan,
 		// The generic-family defaults Chrome ships on Windows. Blink
 		// resolves the CSS generics through these names, which FontsConf
 		// maps to stand-ins, so a script that measures `fantasy` (Impact,

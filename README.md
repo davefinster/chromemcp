@@ -279,19 +279,36 @@ How a profile is applied (`emulate.go`, `device.go`):
   out in the first family of its stack that exists, and fingerprinting
   scripts measure a list of families to see which do — and, more subtly,
   measure the CSS generic families (`system-ui`, `fantasy`, …) to tell one
-  OS and browser from another. The profile runs Chrome with a fontconfig
-  configuration of its own (`FONTCONFIG_FILE`; `fonts.go`) that presents the
-  image's fonts under Windows names — Segoe UI is Selawik, Microsoft's own
-  OFL-licensed metric-compatible stand-in; Calibri and Cambria are Carlito
-  and Caladea; Arial, Times New Roman and Courier New are Liberation; Verdana,
-  Tahoma and the rest of the common ones are DejaVu; Impact and the condensed
-  faces are Liberation Sans Narrow; the East Asian families are Noto CJK — and
-  hides the image's own family names from explicit requests, so `"DejaVu Sans"`
-  in a stylesheet falls through the way it does on Windows. Nothing is renamed;
-  only which names find which fonts changes. Chrome accepts a substitute only
-  when the substituted request's first family is the font found, so the file
-  is generated against what `fc-list` says is installed, and a deployment with
-  fewer fonts simply has fewer Windows families.
+  OS and browser from another. The profile gives Chrome a font world of its
+  own (`FONTCONFIG_FILE`; `fonts.go`): a directory of links to the image's
+  fonts, and a configuration that is the whole of what Chrome can see — the
+  system's own is deliberately not included. Each font is renamed, as
+  fontconfig scans it, to the families it stands in for and to nothing else:
+  Segoe UI is Selawik, Microsoft's own OFL-licensed metric-compatible
+  stand-in; Calibri and Cambria are Carlito and Caladea; Arial, Times New
+  Roman and Courier New are Liberation; Verdana, Tahoma and the rest of the
+  common ones are DejaVu; Impact and the condensed faces are Liberation Sans
+  Narrow; the East Asian families are Noto CJK. So the Windows families are
+  present because a font really carries those names, and `"DejaVu Sans"` in a
+  stylesheet falls through the way it does on Windows because nothing carries
+  that name any more. It is generated against what `fc-list` says is
+  installed, so a deployment with fewer fonts simply has fewer Windows
+  families, and built once per sessions directory (~25ms, `fc-cache` included).
+
+  It was done the other way about until Chrome 154 — the system fonts left in
+  place, Windows families aliased onto them, and the image's names hidden by
+  rewriting any request that led with one. That rested on Chrome refusing a
+  match whose family was not the one asked for; 154 no longer refuses it, and
+  every hidden name came back visible while the aliases went on working.
+  Renaming the fonts needs no such cooperation.
+
+  One tell survives and cannot be removed here: Skia keeps its own table of
+  metric-compatible families and answers a request for either of a pair with
+  the other, whatever fontconfig says. A profile that must have Arial
+  therefore also answers to Liberation Sans, and likewise Times New
+  Roman/Liberation Serif, Courier New/Liberation Mono, Calibri/Carlito and
+  Cambria/Caladea. Only the unpaired names — DejaVu, Noto, Selawik, Ubuntu —
+  can be made to disappear, and `TestDeviceIntegration` asserts exactly those.
 - The **generic font families** — what `system-ui`, `serif`, `fantasy` and
   the rest resolve to — Blink picks from its own preferences, not fontconfig,
   so the profile also seeds the profile's `Default/Preferences` (merged, before

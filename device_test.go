@@ -317,9 +317,15 @@ func TestDeviceIntegration(t *testing.T) {
 			t.Errorf("%s: timezone %q language %q", where, fp.Timezone, fp.Language)
 		}
 		// Windows families are there under the image's fonts; the image's
-		// own names are not.
+		// own names are not — with the exception noted in fonts.go, which
+		// this deliberately does not assert: Skia answers a request for a
+		// metric-compatible family with its partner whatever fontconfig
+		// says, so Liberation Sans is visible for as long as Arial is, and
+		// the same goes for Liberation Serif/Times New Roman, Liberation
+		// Mono/Courier New, Carlito/Calibri and Caladea/Cambria. The
+		// unpaired names are the ones a profile can actually take away.
 		for name, want := range map[string]bool{"Segoe UI": true, "Tahoma": true, "Consolas": true, "Arial": true, "Times New Roman": true,
-			"DejaVu Sans": false, "Liberation Sans": false, "Noto Sans": false, "Ubuntu": false} {
+			"DejaVu Sans": false, "Noto Sans": false, "Ubuntu": false, "Selawik": false} {
 			if fp.Fonts[name] != want {
 				t.Errorf("%s: font %q present=%v, want %v (%v)", where, name, fp.Fonts[name], want, fp.Fonts)
 			}
@@ -469,67 +475,114 @@ func TestLocaleLaunch(t *testing.T) {
 	}
 }
 
-func TestWindowsFontsConf(t *testing.T) {
+func testFontSet(families ...string) *fontSet {
+	s := &fontSet{files: map[string][]string{}}
+	for _, f := range families {
+		s.files[f] = []string{"/usr/share/fonts/" + strings.ReplaceAll(f, " ", "") + ".ttf"}
+	}
+	return s
+}
+
+func TestWindowsFontsPlan(t *testing.T) {
 	// A machine with DejaVu and Liberation but no Selawik or Carlito.
-	installed := map[string]bool{"DejaVu Sans": true, "DejaVu Serif": true, "DejaVu Sans Mono": true,
-		"Liberation Sans": true, "Liberation Serif": true, "Liberation Mono": true, "Noto Sans CJK JP": true}
-	conf := windowsFontsConf(installed)
+	fonts := testFontSet("DejaVu Sans", "DejaVu Serif", "DejaVu Sans Mono",
+		"Liberation Sans", "Liberation Serif", "Liberation Mono", "Noto Sans CJK JP")
+	plan := windowsFontsPlan(fonts, "/s/fonts.d", "/s/fonts.cache")
 	for _, want := range []string{
-		// Segoe UI prefers what is there, in order, and nothing that is not.
-		`<family>Segoe UI</family><prefer><family>DejaVu Sans</family><family>Liberation Sans</family></prefer>`,
-		// Calibri's only present substitute.
-		`<family>Calibri</family><prefer><family>Liberation Sans</family></prefer>`,
-		// Hidden families are rewritten to nothing plus a decoy of another family.
-		`<string>DejaVu Sans</string></test><edit name="family" mode="assign_replace"><string>chromemcp-absent</string><string>Noto Sans CJK JP</string></edit>`,
-		`<string>Liberation Sans</string></test><edit name="family" mode="assign_replace"><string>chromemcp-absent</string><string>DejaVu Sans</string></edit>`,
-		`<family>sans-serif</family><prefer><family>DejaVu Sans</family><family>Liberation Sans</family></prefer>`,
+		"<dir>/s/fonts.d</dir>",
+		"<cachedir>/s/fonts.cache</cachedir>",
+		// The file behind DejaVu Sans is renamed to the first family it
+		// answers for and appended the rest, so those names are real and
+		// its own is gone.
+		`<test name="family"><string>DejaVu Sans</string></test><edit name="family" mode="assign_replace"><string>Segoe UI</string></edit>`,
+		`<edit name="family" mode="append"><string>Tahoma</string></edit>`,
+		`<edit name="family" mode="append"><string>Verdana</string></edit>`,
+		// Liberation Sans is the first present substitute for Arial, and
+		// for Calibri, whose own stand-ins are not installed here.
+		`<test name="family"><string>Liberation Sans</string></test><edit name="family" mode="assign_replace"><string>Arial</string></edit>`,
+		`<edit name="family" mode="append"><string>Calibri</string></edit>`,
+		`<family>sans-serif</family><prefer><family>Segoe UI</family><family>Arial</family></prefer>`,
+		`<family>serif</family><prefer><family>Times New Roman</family></prefer>`,
 	} {
-		if !strings.Contains(conf, want) {
-			t.Errorf("conf lacks %s", want)
+		if !strings.Contains(plan.Conf, want) {
+			t.Errorf("plan lacks %s", want)
 		}
 	}
-	// Families with no substitute present are left out, as are hides of
-	// fonts that are not there.
-	for _, absent := range []string{"Selawik", "Carlito", "Yu Mincho", "Microsoft YaHei", "<string>Ubuntu</string>", "<string>Noto Sans</string>"} {
-		if strings.Contains(conf, absent) {
-			t.Errorf("conf mentions %s, which is not installed", absent)
+	// The system configuration is not included: this directory is all
+	// Chrome sees, which is what makes the machine's own names absent.
+	if strings.Contains(plan.Conf, "<include") {
+		t.Error("the plan includes the system configuration")
+	}
+	// A device family with no substitute installed is simply not presented,
+	// and a substitute nothing needs is not linked, so its name goes too.
+	for _, absent := range []string{"Selawik", "Carlito", "<string>Yu Mincho</string>", "Noto Color Emoji"} {
+		if strings.Contains(plan.Conf, absent) {
+			t.Errorf("plan mentions %s, which is not installed or not needed", absent)
 		}
 	}
-	// Impact (Blink's `fantasy`) prefers the condensed narrow font when it
-	// is installed, and falls back to Carlito — always in the image — when
-	// the separate narrow package is not, so `fantasy` stays under the
-	// width a font-fingerprinting script reads as Firefox.
-	withNarrow := map[string]bool{"Liberation Sans Narrow": true, "Carlito": true, "Liberation Sans": true, "Selawik": true, "DejaVu Sans": true, "Noto Sans CJK JP": true}
-	if c := windowsFontsConf(withNarrow); !strings.Contains(c, `<family>Impact</family><prefer><family>Liberation Sans Narrow</family>`) {
-		t.Error("Impact should prefer Liberation Sans Narrow when installed")
+	// Only the files behind substitutes that answer for something.
+	if len(plan.Files) != 7 {
+		t.Errorf("files = %v, want the seven installed substitutes, each of which answers for something", plan.Files)
 	}
-	noNarrow := map[string]bool{"Carlito": true, "Liberation Sans": true, "Selawik": true, "DejaVu Sans": true, "Noto Sans CJK JP": true}
-	if c := windowsFontsConf(noNarrow); !strings.Contains(c, `<family>Impact</family><prefer><family>Carlito</family>`) {
+	for _, f := range plan.Files {
+		if strings.Contains(f, "NotoSansCJKJP") && !strings.Contains(plan.Conf, "MS Gothic") {
+			t.Error("the CJK font was linked without being renamed")
+		}
+	}
+
+	// Impact (Blink's `fantasy`) takes the condensed narrow font when it is
+	// installed, and falls back to Carlito — always in the image — when the
+	// separate narrow package is not, so `fantasy` stays under the width a
+	// font-fingerprinting script reads as Firefox.
+	withNarrow := testFontSet("Liberation Sans Narrow", "Carlito", "Liberation Sans", "Selawik", "DejaVu Sans", "Noto Sans CJK JP")
+	if c := windowsFontsPlan(withNarrow, "d", "c").Conf; !strings.Contains(c,
+		`<test name="family"><string>Liberation Sans Narrow</string></test><edit name="family" mode="assign_replace"><string>Arial Narrow</string></edit><edit name="family" mode="append"><string>Impact</string></edit>`) {
+		t.Error("Impact should be answered by Liberation Sans Narrow when it is installed")
+	}
+	noNarrow := testFontSet("Carlito", "Liberation Sans", "Selawik", "DejaVu Sans", "Noto Sans CJK JP")
+	if c := windowsFontsPlan(noNarrow, "d", "c").Conf; !strings.Contains(c, `<string>Carlito</string></test><edit name="family" mode="assign_replace"><string>Arial Narrow</string></edit><edit name="family" mode="append"><string>Impact</string></edit>`) {
 		t.Error("Impact should fall back to Carlito when the narrow package is absent")
 	}
-	// With no list, everything is assumed present.
-	all := windowsFontsConf(nil)
-	if !strings.Contains(all, `<family>Segoe UI</family><prefer><family>Selawik</family>`) || !strings.Contains(all, "<family>Meiryo</family>") {
-		t.Error("nil installed set should assume every font")
+	// Nothing to present at all is not a configuration.
+	if p := windowsFontsPlan(testFontSet(), "d", "c"); p.Conf != "" || p.Files != nil {
+		t.Errorf("a machine with no usable font produced %+v", p)
 	}
-	// The file round-trips through the profile.
+
+	// The world round-trips onto disk: the directory holds a link per file,
+	// the second call changes nothing, and a profile of the machine's own
+	// fonts has no configuration at all.
 	dir := t.TempDir()
 	d, _ := lookupDevice("windows")
-	p, err := d.fontsConfFile(dir, installed)
+	real := installedFonts()
+	if real == nil {
+		t.Skip("no fc-list")
+	}
+	p, err := d.fontsConfFile(dir, real)
 	if err != nil || p == "" {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(p); string(b) != conf {
-		t.Error("written config differs")
+	links, err := os.ReadDir(filepath.Join(dir, "fonts-windows.d"))
+	if err != nil || len(links) == 0 {
+		t.Fatalf("font directory: %d links, %v", len(links), err)
 	}
-	if p2, err := d.fontsConfFile(dir, installed); err != nil || p2 != p {
-		t.Errorf("second write: %s %v", p2, err)
+	for _, l := range links {
+		target, err := os.Readlink(filepath.Join(dir, "fonts-windows.d", l.Name()))
+		if err != nil {
+			t.Errorf("%s is not a link: %v", l.Name(), err)
+		} else if _, err := os.Stat(target); err != nil {
+			t.Errorf("%s points nowhere: %v", l.Name(), err)
+		}
 	}
-	if p, _ := deviceProfiles[nativeDevice].fontsConfFile(dir, installed); p != "" {
+	if p2, err := d.fontsConfFile(dir, real); err != nil || p2 != p {
+		t.Errorf("second build: %s %v", p2, err)
+	}
+	if p, _ := deviceProfiles[nativeDevice].fontsConfFile(dir, real); p != "" {
 		t.Error("native profile has a fonts file")
 	}
+	if p, _ := d.fontsConfFile(dir, nil); p != "" {
+		t.Error("a machine whose fonts cannot be listed got a configuration")
+	}
 }
-
 func TestClientHintHeaders(t *testing.T) {
 	ver := chromeVersion{Full: "152.0.7977.82", Major: "152"}
 	if h := deviceProfiles[nativeDevice].clientHintHeaders(ver); h != nil {

@@ -160,20 +160,20 @@ type manager struct {
 	sessions map[string]*session
 
 	verMu       sync.Mutex
-	ver         *chromeVersion  // the binary's version, probed on first need
-	fonts       map[string]bool // the machine's font families, listed on first need
+	ver         *chromeVersion // the binary's version, probed on first need
+	fonts       *fontSet       // the machine's fonts, listed on first need
 	fontsListed bool
 }
 
-// installedFonts is the machine's font families, listed once.
-func (m *manager) installedFonts() map[string]bool {
+// installedFonts is the machine's fonts, listed once.
+func (m *manager) installedFonts() *fontSet {
 	m.verMu.Lock()
 	defer m.verMu.Unlock()
 	if !m.fontsListed {
 		m.fonts = installedFonts()
 		m.fontsListed = true
 		if m.fonts == nil {
-			logf("fc-list unavailable: device profiles assume every substitute font is installed")
+			logf("fc-list unavailable: device profiles cannot present the machine's fonts under their own family names")
 		}
 	}
 	return m.fonts
