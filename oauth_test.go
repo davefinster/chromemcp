@@ -81,7 +81,7 @@ func (as *fakeAS) mint(t *testing.T, overrides map[string]any) string {
 		"aud":   "https://chromemcp.example.com",
 		"exp":   time.Now().Add(time.Hour).Unix(),
 		"iat":   time.Now().Unix(),
-		"email": "me@dmf.zone",
+		"email": "me@example.com",
 	}
 	for k, v := range overrides {
 		if v == nil {
@@ -141,7 +141,7 @@ func get(t *testing.T, h http.Handler, path, token string) *httptest.ResponseRec
 
 func TestOAuthHandlerTokens(t *testing.T) {
 	as := newFakeAS(t)
-	h := newTestHandler(t, as, "me@dmf.zone")
+	h := newTestHandler(t, as, "me@example.com")
 
 	other := newFakeAS(t) // trusted by nobody: its key is not in as's JWKS
 
@@ -152,7 +152,7 @@ func TestOAuthHandlerTokens(t *testing.T) {
 	}{
 		{"valid", as.mint(t, nil), http.StatusOK},
 		{"valid audience array", as.mint(t, map[string]any{"aud": []string{"x", "https://chromemcp.example.com"}}), http.StatusOK},
-		{"valid email case-insensitive", as.mint(t, map[string]any{"email": "ME@DMF.ZONE"}), http.StatusOK},
+		{"valid email case-insensitive", as.mint(t, map[string]any{"email": "ME@EXAMPLE.COM"}), http.StatusOK},
 		{"missing token", "", http.StatusUnauthorized},
 		{"garbage", "not-a-jwt", http.StatusUnauthorized},
 		{"expired", as.mint(t, map[string]any{"exp": time.Now().Add(-2 * time.Hour).Unix()}), http.StatusUnauthorized},
@@ -169,7 +169,7 @@ func TestOAuthHandlerTokens(t *testing.T) {
 		// refetch is rate-limited away and the key stays unknown.
 		{"unknown kid", as.sign(t, map[string]any{"alg": "RS256", "kid": "rotated"}, map[string]any{
 			"iss": as.URL, "aud": "https://chromemcp.example.com",
-			"exp": time.Now().Add(time.Hour).Unix(), "email": "me@dmf.zone",
+			"exp": time.Now().Add(time.Hour).Unix(), "email": "me@example.com",
 		}), http.StatusUnauthorized},
 	}
 	for _, tt := range tests {
@@ -193,7 +193,7 @@ func TestOAuthHandlerNoEmailPin(t *testing.T) {
 
 func TestOAuthChallengeAdvertisesMetadata(t *testing.T) {
 	as := newFakeAS(t)
-	h := newTestHandler(t, as, "me@dmf.zone")
+	h := newTestHandler(t, as, "me@example.com")
 
 	w := get(t, h, "/", "")
 	if w.Code != http.StatusUnauthorized {
@@ -208,7 +208,7 @@ func TestOAuthChallengeAdvertisesMetadata(t *testing.T) {
 
 func TestOAuthWellKnown(t *testing.T) {
 	as := newFakeAS(t)
-	h := newTestHandler(t, as, "me@dmf.zone")
+	h := newTestHandler(t, as, "me@example.com")
 
 	// Protected-resource metadata (RFC 9728) is served without a token.
 	req := httptest.NewRequest("GET", "/.well-known/oauth-protected-resource", nil)
@@ -261,7 +261,7 @@ func TestPublicHostBehindLoopbackProxy(t *testing.T) {
 	h, err := newHTTPHandler(server, &oauthConfig{
 		Issuer:       as.URL,
 		PublicURL:    "https://chromemcp.example.com",
-		AllowedEmail: "me@dmf.zone",
+		AllowedEmail: "me@example.com",
 	}, nil)
 	if err != nil {
 		t.Fatal(err)

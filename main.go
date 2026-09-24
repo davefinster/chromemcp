@@ -1,13 +1,13 @@
 // chromemcp gives an agent a Chrome of its own: an MCP server that launches
 // Chrome instances (headless, or headful on a private VNC display), drives
 // them, and hands back what the page looks like after every action. It is
-// OAuth-protected the way the other dmf.zone MCP servers are, and can pass
+// protected by an OAuth authorization server of your choosing, and can pass
 // each session through to Google's Chrome DevTools MCP for the low-level
 // work (network, performance, emulation) this server does not reimplement.
 //
 //	chromemcp serve -http :8787 \                    public deployment
 //	  -oauth-issuer https://<env>.authkit.app \
-//	  -public-url https://chromemcp.dmf.zone \
+//	  -public-url https://chromemcp.example.com \
 //	  -allowed-email you@example.com \
 //	  -identities-dir /data/identities
 //	chromemcp serve -http 127.0.0.1:8787              local, no auth

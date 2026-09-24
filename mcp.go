@@ -1,7 +1,7 @@
 package main
 
-// The MCP surface, on the official Go SDK — the same transport and OAuth
-// stack as the sibling dmf.zone servers. Three groups of tools: sessions
+// The MCP surface, on the official Go SDK, over its Streamable HTTP
+// transport behind the OAuth stack in oauth.go. Three groups of tools: sessions
 // (start / list / resume / stop / delete / live view), identities (the
 // persistent logged-in profiles), and the browser itself, plus the pair
 // that passes a session through to chrome-devtools-mcp.

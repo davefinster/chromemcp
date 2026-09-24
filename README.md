@@ -3,9 +3,9 @@
 A [Model Context Protocol](https://modelcontextprotocol.io) server that gives
 an agent Chrome browsers of its own: it launches Chrome instances — headless,
 or headful on a private VNC display — drives them, and hands back what the
-page looks like after every action. It is OAuth-protected the way the sibling
-dmf.zone MCP servers (`m2mcp`, `barrys`, `trackmcp`, `hivemcp`) are, and can
-pass each session through to Google's
+page looks like after every action. It sits behind an OAuth authorization
+server of your choosing (built for WorkOS AuthKit, but any RFC 8414 issuer
+works), and can pass each session through to Google's
 [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp)
 for the low-level work it does not reimplement.
 
@@ -339,8 +339,8 @@ chromemcp serve
 # the deployment
 chromemcp serve -http :8787 \
   -oauth-issuer https://<env>.authkit.app \
-  -public-url https://chromemcp.dmf.zone \
-  -allowed-email me@dmf.zone \
+  -public-url https://chromemcp.example.com \
+  -allowed-email you@example.com \
   -identities-dir /data/identities
 ```
 
@@ -406,8 +406,8 @@ sessions under `/tmp`:
 ```bash
 docker run -d --name chromemcp -p 127.0.0.1:8787:8787 -v chromemcp:/data --shm-size=1g \
   ghcr.io/davefinster/chromemcp serve -http :8787 \
-    -oauth-issuer https://<env>.authkit.app -public-url https://chromemcp.dmf.zone \
-    -allowed-email me@dmf.zone
+    -oauth-issuer https://<env>.authkit.app -public-url https://chromemcp.example.com \
+    -allowed-email you@example.com
 ```
 
 The image sets `CHROMEMCP_NO_SANDBOX=1`: Chrome's sandbox needs user
@@ -415,12 +415,11 @@ namespaces that container runtimes usually withhold. Drop it on a runtime
 that grants them. `--disable-dev-shm-usage` is always on, so a small
 `/dev/shm` does not crash tabs, but a real one is kinder.
 
-A homelab deployment follows the `services/hivemcp` pattern in `infralife`:
-the pod on the global-infrastructure tailnet behind the edge at
-`chromemcp.dmf.zone`, `/healthz` as the backend check, a claim mounted at
-`/data` for the identities (the one thing worth keeping), an emptyDir for
-`/tmp`, and a memory request that allows for `-max-running` Chromes at a
-few hundred MB each. The edge must pass websockets for `/view/`.
+On Kubernetes: the pod behind whatever reverse proxy terminates TLS for it,
+`/healthz` as the backend check, a persistent claim mounted at `/data` for
+the identities (the one thing worth keeping), an emptyDir for `/tmp`, and a
+memory request that allows for `-max-running` Chromes at a few hundred MB
+each. The proxy must pass websockets for `/view/`.
 
 ## Tests
 
@@ -449,3 +448,7 @@ and chooses a file through it, because that page's JavaScript only ever runs
 in a browser. They
 skip themselves where there is no Chrome, as in the image's build stage;
 `CHROMEMCP_TEST_NO_CHROME=1` skips them anywhere.
+
+## Licence
+
+[MIT](LICENSE).
