@@ -71,6 +71,21 @@ timezone and locale are set per session the same way.`
 type mcpApp struct {
 	mgr   *manager
 	views *viewHandler
+	// guidance is what whoever runs this server wants agents to know about
+	// it -- the setups to prefer, the identities to use for what (-guidance).
+	guidance string
+}
+
+// instructions are the server's instructions with the deployment's guidance
+// first. First, because a client may cut instructions short (claude.ai does,
+// at a couple of thousand characters) and the generic text is the part an
+// agent can best do without.
+func (a *mcpApp) instructions() string {
+	if a.guidance == "" {
+		return mcpInstructions
+	}
+	return "THIS DEPLOYMENT: guidance from whoever runs this server. Follow it unless the user asks for something else.\n" +
+		a.guidance + "\n\n" + mcpInstructions
 }
 
 // runMCP serves until ctx is done, then drains briefly and returns.
@@ -141,7 +156,7 @@ func newMCPServer(app *mcpApp, logger *slog.Logger) *mcp.Server {
 		Name:    "chromemcp",
 		Title:   "Chrome browser sessions",
 		Version: version,
-	}, &mcp.ServerOptions{Instructions: mcpInstructions, Logger: logger})
+	}, &mcp.ServerOptions{Instructions: app.instructions(), Logger: logger})
 	app.register(server)
 	return server
 }
@@ -193,8 +208,8 @@ type sessionStartIn struct {
 	Label    string `json:"label,omitempty" jsonschema:"a short note on what the session is for, shown by session_list"`
 	Viewport string `json:"viewport,omitempty" jsonschema:"page size WxH, e.g. 1280x800 (the server default) or 390x844 for a phone-sized page"`
 	Device   string `json:"device,omitempty" jsonschema:"device profile the browser presents to sites: windows (the default: a Windows 11 PC running Chrome, with Windows user agent and client hints, navigator.platform Win32, 1920x1080 screen, NVIDIA GPU strings) or linux (this server's own Chrome as it is, no emulation), or mac where offered (a real Mac's Chrome on a node: its own GPU and fonts; headless, no identities)"`
-	Timezone string `json:"timezone,omitempty" jsonschema:"IANA time zone the browser runs in, e.g. Europe/London or Australia/Sydney (default: the server's, UTC in the container)"`
-	Locale   string `json:"locale,omitempty" jsonschema:"browser language as a tag, e.g. en-US, en-GB, de-DE: sets Accept-Language, navigator.language and the Intl defaults (default: the server's, en-US)"`
+	Timezone string `json:"timezone,omitempty" jsonschema:"IANA time zone the browser runs in, e.g. Europe/London or Australia/Sydney (default: the zone of the machine Chrome runs on -- this server's own, which is UTC in a stock container unless the deployment sets TZ; for device=mac, the Mac's)"`
+	Locale   string `json:"locale,omitempty" jsonschema:"browser language as a tag, e.g. en-US, en-GB, de-DE: sets Accept-Language, navigator.language and the Intl defaults (default: the language of the machine Chrome runs on -- this server's, en-US in a stock container; for device=mac, the Mac account's)"`
 	URL      string `json:"url,omitempty" jsonschema:"open this URL right away"`
 }
 
@@ -390,6 +405,13 @@ func sessionStartSchema(names []string) *jsonschema.Schema {
 
 func (a *mcpApp) register(s *mcp.Server) {
 	// ---- sessions ----
+	// The deployment's guidance goes into session_start's description as well
+	// as the instructions: it is about how to start a session, and a tool's
+	// description is in front of an agent at the moment it chooses.
+	startGuidance := ""
+	if a.guidance != "" {
+		startGuidance = " THIS DEPLOYMENT (follow unless the user asks otherwise): " + a.guidance
+	}
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "session_start",
 		InputSchema: sessionStartSchema(a.mgr.deviceNames()),
@@ -398,7 +420,7 @@ func (a *mcpApp) register(s *mcp.Server) {
 			"mode=headful for a browser a person can watch and drive (session_view), or for sites that block headless Chrome. " +
 			"Presents itself to sites as a Windows 11 PC running Chrome unless device=linux asks for this server's own Chrome as it is, " +
 			"or device=mac (where offered) runs it on a real Mac -- headless, and without identities for now; " +
-			"timezone and locale set where and in what language it runs.",
+			"timezone and locale set where and in what language it runs." + startGuidance,
 		Annotations: acts("Start a browser session"),
 	}, a.sessionStart)
 	mcp.AddTool(s, &mcp.Tool{

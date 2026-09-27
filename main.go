@@ -208,6 +208,9 @@ func serve(args []string) int {
 		uploadTTL  = fs.Duration("upload-ttl", envDuration("CHROMEMCP_UPLOAD_TTL", time.Hour), "how long an upload link stays valid")
 		verbose    = fs.Bool("verbose", false, "log the MCP SDK and Chrome's stderr chatter")
 
+		guidance     = fs.String("guidance", env("CHROMEMCP_GUIDANCE", ""), "text for agents about this deployment -- the setups to prefer, which identity for what -- put first in the server's instructions and in session_start's description (env CHROMEMCP_GUIDANCE)")
+		guidanceFile = fs.String("guidance-file", env("CHROMEMCP_GUIDANCE_FILE", ""), "read -guidance from this file instead (env CHROMEMCP_GUIDANCE_FILE)")
+
 		nodes    multiFlag
 		nodeCert = fs.String("node-cert", env("CHROMEMCP_NODE_CERT", ""), "client certificate this server presents to its nodes, PEM; re-read when it changes (env CHROMEMCP_NODE_CERT)")
 		nodeKey  = fs.String("node-key", env("CHROMEMCP_NODE_KEY", ""), "its key (env CHROMEMCP_NODE_KEY)")
@@ -251,6 +254,18 @@ func serve(args []string) int {
 			host = "127.0.0.1"
 		}
 		base = "http://" + host + ":" + port
+	}
+
+	text := strings.TrimSpace(*guidance)
+	if *guidanceFile != "" {
+		if text != "" {
+			die(errors.New("-guidance and -guidance-file are alternatives; give one"))
+		}
+		b, err := os.ReadFile(*guidanceFile)
+		if err != nil {
+			die(fmt.Errorf("guidance: %w", err))
+		}
+		text = strings.TrimSpace(string(b))
 	}
 
 	nodeSpecs := []string(nodes)
@@ -314,7 +329,10 @@ func serve(args []string) int {
 	}
 	go mgr.reaper(ctx)
 
-	app := &mcpApp{mgr: mgr}
+	app := &mcpApp{mgr: mgr, guidance: text}
+	if text != "" {
+		logf("deployment guidance for agents: %d characters", len(text))
+	}
 	views := newViewHandler(mgr, *novncDir)
 	err = runMCP(ctx, app, *httpAddr, oauthCfg, views, *verbose)
 	mgr.shutdown()

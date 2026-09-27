@@ -378,6 +378,7 @@ matter:
 | `-idle-park`, `-max-age`, `-max-running` | `CHROMEMCP_IDLE_PARK`, … | 30m, 24h, 6 |
 | `-view-ttl`, `-view-url` | `CHROMEMCP_VIEW_TTL`, `CHROMEMCP_VIEW_URL` | 30m; `-public-url` |
 | `-upload-ttl` | `CHROMEMCP_UPLOAD_TTL` | 1h (upload links; they share `-view-url`) |
+| `-guidance`, `-guidance-file` | `CHROMEMCP_GUIDANCE`, `CHROMEMCP_GUIDANCE_FILE` | none ([Deployment guidance](#deployment-guidance)) |
 | `-node NAME=URL` | `CHROMEMCP_NODES` (space-separated) | none; repeatable ([Nodes](#nodes)) |
 | `-node-cert`, `-node-key`, `-node-ca` | `CHROMEMCP_NODE_CERT`, `…_KEY`, `…_CA` | the client certificate presented to nodes, and the CA theirs chain to |
 
@@ -393,6 +394,24 @@ reports as `state: Field required` from its callback), and a JWT template of
 `{"email": "{{user.email}}"}` so the `-allowed-email` pin has a claim to
 match. Any RFC 8414 issuer that puts those claims in an RS256 access token
 works just as well.
+
+### Deployment guidance
+
+What a deployment prefers — which device for what, which identity for which
+accounts, headful or not — is the operator's to say, not this repository's.
+`-guidance` (or `-guidance-file`) is that text. It goes **first** in the
+server's instructions, ahead of the generic text, because a client may cut
+instructions short (claude.ai does, at a couple of thousand characters), and
+again at the end of `session_start`'s description, which is in front of an
+agent when it picks a setup. Keep it short and concrete, for example:
+
+```bash
+chromemcp serve ... -guidance 'For anonymous browsing, session_start device="mac" (headless).
+For tasks that need my own accounts, device="windows", identity="me", mode="headful".'
+```
+
+Without it the server says nothing of the kind, and agents take the
+defaults.
 
 ### Logging in as yourself
 

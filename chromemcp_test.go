@@ -416,3 +416,57 @@ func TestHealthz(t *testing.T) {
 		t.Errorf("%d %s", w.Code, w.Body.String())
 	}
 }
+
+// A deployment's guidance reaches an agent twice: first in the server's
+// instructions (before the generic text, which a client may cut short) and
+// in session_start's description, where the choice of setup is made.
+func TestDeploymentGuidance(t *testing.T) {
+	const guidance = "Prefer device=mac, headless, for anything anonymous."
+	for _, g := range []string{"", guidance} {
+		mgr, err := newManager(&managerConfig{
+			SessionsDir: filepath.Join(t.TempDir(), "s"), IdentitiesDir: filepath.Join(t.TempDir(), "i"), Chrome: "/nonexistent",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		server := newMCPServer(&mcpApp{mgr: mgr, guidance: g}, nil)
+		ct, st := mcp.NewInMemoryTransports()
+		ctx := context.Background()
+		if _, err := server.Connect(ctx, st, nil); err != nil {
+			t.Fatal(err)
+		}
+		cs, err := mcp.NewClient(&mcp.Implementation{Name: "t", Version: "0"}, nil).Connect(ctx, ct, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		instructions := cs.InitializeResult().Instructions
+		res, err := cs.ListTools(ctx, nil)
+		cs.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var start *mcp.Tool
+		for _, tool := range res.Tools {
+			if tool.Name == "session_start" {
+				start = tool
+			}
+		}
+		if g == "" {
+			if instructions != mcpInstructions || strings.Contains(start.Description, "THIS DEPLOYMENT") {
+				t.Errorf("no guidance, yet the instructions or session_start changed: %q", start.Description)
+			}
+			continue
+		}
+		if !strings.HasPrefix(instructions, "THIS DEPLOYMENT") || !strings.Contains(instructions[:200], guidance) ||
+			!strings.HasSuffix(instructions, mcpInstructions) {
+			t.Errorf("guidance is not first in the instructions: %.300q", instructions)
+		}
+		if !strings.Contains(start.Description, guidance) {
+			t.Errorf("session_start description lacks the guidance: %q", start.Description)
+		}
+		raw, _ := json.Marshal(start.InputSchema)
+		if !strings.Contains(string(raw), "for device=mac, the Mac's") {
+			t.Errorf("timezone default does not describe a mac node: %s", raw)
+		}
+	}
+}
