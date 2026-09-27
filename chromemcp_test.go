@@ -157,20 +157,20 @@ func TestIdentityStore(t *testing.T) {
 	fakeProfile(t, filepath.Join(session, "profile"))
 	os.WriteFile(filepath.Join(session, cookiesFile), []byte(`[{"name":"sid","value":"1","domain":"a.test","path":"/"}]`), 0o600)
 
-	if _, err := st.save("Bad Name", "", "s", session, false); err == nil {
+	if _, err := st.save("Bad Name", "", "s", "", session, false); err == nil {
 		t.Error("bad name accepted")
 	}
-	m, err := st.save("google-me", "google me@example.com", "s-1", session, false)
+	m, err := st.save("google-me", "google me@example.com", "s-1", "", session, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if m.Name != "google-me" || m.Note != "google me@example.com" || m.Bytes == 0 {
 		t.Errorf("meta %+v", m)
 	}
-	if _, err := st.save("google-me", "", "s-2", session, false); err == nil || !strings.Contains(err.Error(), "overwrite") {
+	if _, err := st.save("google-me", "", "s-2", "", session, false); err == nil || !strings.Contains(err.Error(), "overwrite") {
 		t.Errorf("second save without overwrite: %v", err)
 	}
-	m2, err := st.save("google-me", "", "s-2", session, true)
+	m2, err := st.save("google-me", "", "s-2", "", session, true)
 	if err != nil {
 		t.Fatal(err)
 	}

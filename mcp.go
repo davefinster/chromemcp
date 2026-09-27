@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -65,8 +66,8 @@ sites it visits â€” user agent, client hints, navigator.platform, screen, GPU â€
 what most sites expect of an ordinary visitor. session_start device="linux" is this
 server's own Chrome as it is, for comparing how a site treats the two. Where this
 server has a Mac node, device="mac" is a real Mac's Chrome (its own GPU and fonts,
-nothing emulated but the headless tells): headless only, and no identities yet.
-timezone and locale are set per session the same way.`
+nothing emulated but the headless tells), headless or headful, with identities as
+anywhere else. timezone and locale are set per session the same way.`
 
 type mcpApp struct {
 	mgr   *manager
@@ -207,7 +208,7 @@ type sessionStartIn struct {
 	Identity string `json:"identity,omitempty" jsonschema:"start on a copy of this saved identity's profile, i.e. already logged in as that user (identity_list)"`
 	Label    string `json:"label,omitempty" jsonschema:"a short note on what the session is for, shown by session_list"`
 	Viewport string `json:"viewport,omitempty" jsonschema:"page size WxH, e.g. 1280x800 (the server default) or 390x844 for a phone-sized page"`
-	Device   string `json:"device,omitempty" jsonschema:"device profile the browser presents to sites: windows (the default: a Windows 11 PC running Chrome, with Windows user agent and client hints, navigator.platform Win32, 1920x1080 screen, NVIDIA GPU strings) or linux (this server's own Chrome as it is, no emulation), or mac where offered (a real Mac's Chrome on a node: its own GPU and fonts; headless, no identities)"`
+	Device   string `json:"device,omitempty" jsonschema:"device profile the browser presents to sites: windows (the default: a Windows 11 PC running Chrome, with Windows user agent and client hints, navigator.platform Win32, 1920x1080 screen, NVIDIA GPU strings) or linux (this server's own Chrome as it is, no emulation), or mac where offered (a real Mac's Chrome on a node: its own GPU and fonts)"`
 	Timezone string `json:"timezone,omitempty" jsonschema:"IANA time zone the browser runs in, e.g. Europe/London or Australia/Sydney (default: the zone of the machine Chrome runs on -- this server's own, which is UTC in a stock container unless the deployment sets TZ; for device=mac, the Mac's)"`
 	Locale   string `json:"locale,omitempty" jsonschema:"browser language as a tag, e.g. en-US, en-GB, de-DE: sets Accept-Language, navigator.language and the Intl defaults (default: the language of the machine Chrome runs on -- this server's, en-US in a stock container; for device=mac, the Mac account's)"`
 	URL      string `json:"url,omitempty" jsonschema:"open this URL right away"`
@@ -419,7 +420,7 @@ func (a *mcpApp) register(s *mcp.Server) {
 			"(already logged in as that user). Returns the session_id every other tool needs. Headless by default; " +
 			"mode=headful for a browser a person can watch and drive (session_view), or for sites that block headless Chrome. " +
 			"Presents itself to sites as a Windows 11 PC running Chrome unless device=linux asks for this server's own Chrome as it is, " +
-			"or device=mac (where offered) runs it on a real Mac -- headless, and without identities for now; " +
+			"or device=mac (where offered) runs it on a real Mac; " +
 			"timezone and locale set where and in what language it runs." + startGuidance,
 		Annotations: acts("Start a browser session"),
 	}, a.sessionStart)
@@ -445,8 +446,9 @@ func (a *mcpApp) register(s *mcp.Server) {
 	}, a.sessionDelete)
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "session_view",
-		Description: "A live-view link for a HEADFUL session: a web page showing that Chrome, with mouse and keyboard, for a person to open. " +
+		Description: "A live-view link: a web page showing that Chrome, with mouse and keyboard, for a person to open. " +
 			"Give it to the owner when they need to log in to an account (then identity_save), solve a captcha, or watch. " +
+			"Any session has one; a headful one is what to start for a login, since it looks like an ordinary browser to the site. " +
 			"The link expires; ask again for a new one.",
 		Annotations: acts("Live-view link"),
 	}, a.sessionView)
@@ -653,6 +655,12 @@ func (a *mcpApp) sessionStart(ctx context.Context, req *mcp.CallToolRequest, in 
 			r.addf("sites see %s.", d.Description)
 		}
 	}
+	if s.meta.Identity != "" {
+		if im, err := a.mgr.identities.get(s.meta.Identity); err == nil && im.Device != "" && im.Device != s.meta.deviceName() {
+			r.addf("identity %s was saved from a %s session: its cookies and site storage came along, its saved passwords did not, "+
+				"and a site may see this as a sign-in from a new device.", im.Name, im.Device)
+		}
+	}
 	if s.meta.Mode == modeHeadful {
 		r.addf("session_view gives a person a live view of this browser.")
 	}
@@ -763,8 +771,8 @@ func (a *mcpApp) sessionDelete(ctx context.Context, req *mcp.CallToolRequest, in
 }
 
 func (a *mcpApp) sessionView(ctx context.Context, req *mcp.CallToolRequest, in sessionIn) (*mcp.CallToolResult, any, error) {
-	if a.views == nil || !a.views.available() {
-		return nil, nil, fmt.Errorf("live views are unavailable on this server (needs Xvnc and noVNC)")
+	if a.views == nil {
+		return nil, nil, fmt.Errorf("live views are unavailable on this server")
 	}
 	if a.mgr.cfg.ViewBase == "" {
 		return nil, nil, fmt.Errorf("live views need the HTTP transport (serve -http); there is no URL to give out over stdio")
@@ -773,12 +781,21 @@ func (a *mcpApp) sessionView(ctx context.Context, req *mcp.CallToolRequest, in s
 	if err != nil {
 		return nil, nil, err
 	}
-	if s.meta.Mode != modeHeadful {
-		return nil, nil, fmt.Errorf("session %s is headless; only headful sessions have a live view (start one with mode=headful)", s.meta.ID)
+	s.mu.Lock()
+	onDisplay := s.disp != nil
+	s.mu.Unlock()
+	// A headful session here is on an Xvnc display, shown through noVNC. Any
+	// other -- a node's, headful or not, or a headless one here -- has no
+	// display, and is shown through a screencast (castview.go).
+	if onDisplay && !a.views.available() {
+		return nil, nil, fmt.Errorf("live views of headful sessions need noVNC on this server")
 	}
 	s.touch()
 	tok, exp := a.mgr.views.issue(s.meta.ID)
 	u := fmt.Sprintf("%s/view/%s/vnc.html?autoconnect=1&resize=scale&path=ws", a.mgr.cfg.ViewBase, tok)
+	if !onDisplay {
+		u = fmt.Sprintf("%s/view/%s/cast", a.mgr.cfg.ViewBase, tok)
+	}
 	return text(fmt.Sprintf("Live view of session %s (valid until %s, %s from now):\n%s\n\n"+
 		"Anyone with the link can see and control this browser until then. Whatever they log in to stays in the session; "+
 		"identity_save keeps it for future sessions.",
@@ -799,6 +816,9 @@ func (a *mcpApp) identityList(ctx context.Context, req *mcp.CallToolRequest, in 
 	fmt.Fprintf(&sb, "%d saved identities:\n", len(ids))
 	for _, m := range ids {
 		fmt.Fprintf(&sb, "- %s  saved %s (%.1f MB)", m.Name, m.Updated.Format("2006-01-02 15:04"), float64(m.Bytes)/1e6)
+		if m.Device != "" {
+			fmt.Fprintf(&sb, " from a %s session", m.Device)
+		}
 		if m.Note != "" {
 			fmt.Fprintf(&sb, "  %s", m.Note)
 		}
@@ -815,8 +835,9 @@ func (a *mcpApp) identitySave(ctx context.Context, req *mcp.CallToolRequest, in 
 	if err != nil {
 		return nil, nil, err
 	}
-	if s.meta.Node != "" {
-		return nil, nil, fmt.Errorf("session %s runs on node %s, where identities are not supported yet", s.meta.ID, s.meta.Node)
+	node, err := s.remote()
+	if err != nil {
+		return nil, nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -824,7 +845,18 @@ func (a *mcpApp) identitySave(ctx context.Context, req *mcp.CallToolRequest, in 
 	wasRunning := s.isRunning()
 	// Chrome must be closed for its databases to be consistent on disk.
 	s.park()
-	m, err := a.mgr.identities.save(in.Name, in.Note, s.meta.ID, s.dir, in.Overwrite)
+	var m *identityMeta
+	if node != nil {
+		// A node session's profile is on the node: fetch it beside the
+		// cookie jar the park just exported, save the two, and drop the copy.
+		os.RemoveAll(s.profileDir())
+		if _, err = node.pullProfile(ctx, s.meta.ID, s.profileDir()); err == nil {
+			m, err = a.mgr.identities.save(in.Name, in.Note, s.meta.ID, s.meta.deviceName(), s.dir, in.Overwrite)
+		}
+		os.RemoveAll(s.profileDir())
+	} else {
+		m, err = a.mgr.identities.save(in.Name, in.Note, s.meta.ID, s.meta.deviceName(), s.dir, in.Overwrite)
+	}
 	var relaunch error
 	if wasRunning {
 		relaunch = s.launch(ctx)
