@@ -1,0 +1,47 @@
+# Binaries for a tagged release. The image (docker.yml) is what a server
+# runs; a node runs on a Mac, which no image serves, so `chromemcp node`
+# ships as a plain binary instead — darwin for the node, linux alongside it
+# for anyone running the server outside a container — with a SHA256SUMS a
+# deployment can pin (README: Nodes).
+#
+# Go cross-compiles all four from one runner with cgo off; darwin/arm64 is
+# signed ad hoc by the Go linker itself, which is all macOS asks of a binary
+# that did not come through a browser download (no quarantine attribute).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the release and its assets
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir dist
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
+            os=${target%/*} arch=${target#*/}
+            GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+              -o "dist/chromemcp-${os}-${arch}" .
+          done
+          cd dist && sha256sum chromemcp-* > SHA256SUMS && cat SHA256SUMS
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

@@ -527,6 +527,10 @@ matches the *sending* socket and the replies from its own listeners would
 otherwise meet the block. `chromemcp node -h` lists the rest: `-ports`,
 `-max-running` (default 1), `-sessions-dir` (`~/Library/Caches/chromemcp-node`).
 
+The binary comes from the repository's releases: every `v*` tag attaches
+`chromemcp-darwin-arm64` (and darwin/amd64, linux/amd64, linux/arm64) with a
+`SHA256SUMS` to pin against (`.github/workflows/release.yml`).
+
 Then on the server:
 
 ```bash
