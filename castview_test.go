@@ -5,7 +5,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"image"
+	"image/jpeg"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chromedp/cdproto/page"
 	"github.com/coder/websocket"
 )
 
@@ -185,5 +189,29 @@ func TestCastView(t *testing.T) {
 	}
 	if s.viewers.Load() != 0 {
 		t.Errorf("viewers = %d after the viewer left", s.viewers.Load())
+	}
+}
+
+// A frame whose metadata says 0x0 is sized from the JPEG instead, or every
+// click on it would land at the page's corner.
+func TestFrameSize(t *testing.T) {
+	var buf bytes.Buffer
+	img := image.NewRGBA(image.Rect(0, 0, 320, 200))
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	data := base64.StdEncoding.EncodeToString(buf.Bytes())
+	for _, tc := range []struct {
+		meta *page.ScreencastFrameMetadata
+		w, h float64
+	}{
+		{&page.ScreencastFrameMetadata{DeviceWidth: 1280, DeviceHeight: 800}, 1280, 800},
+		{&page.ScreencastFrameMetadata{}, 320, 200},
+		{nil, 320, 200},
+	} {
+		w, h := frameSize(&page.EventScreencastFrame{Data: data, Metadata: tc.meta})
+		if w != tc.w || h != tc.h {
+			t.Errorf("metadata %+v: %vx%v, want %vx%v", tc.meta, w, h, tc.w, tc.h)
+		}
 	}
 }

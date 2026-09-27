@@ -20,11 +20,14 @@ package main
 // on the machine's own authenticator, the browser's own menus.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image/jpeg"
 	"net/http"
 	"sync"
 	"time"
@@ -248,10 +251,11 @@ func (v *caster) handle(m *cdproto.Message) {
 		v.mu.Lock()
 		current := m.SessionID == v.sid
 		v.mu.Unlock()
-		if !current || ev.Metadata == nil {
+		if !current {
 			return
 		}
-		b, _ := json.Marshal(map[string]any{"t": "frame", "data": ev.Data, "w": ev.Metadata.DeviceWidth, "h": ev.Metadata.DeviceHeight})
+		w, h := frameSize(&ev)
+		b, _ := json.Marshal(map[string]any{"t": "frame", "data": ev.Data, "w": w, "h": h})
 		v.ws.Write(v.ctx, websocket.MessageText, b)
 	case "Target.targetCreated":
 		var ev target.EventTargetCreated
@@ -301,6 +305,27 @@ func (v *caster) handle(m *cdproto.Message) {
 			v.sendTabs()
 		}
 	}
+}
+
+// frameSize is the size, in the page's CSS pixels, that a frame shows --
+// what the viewer scales a click on it by. It is the frame's metadata, which
+// Chrome sometimes sends as 0x0: seen on a headful Mac session while Google
+// waited on a security key, where every click then landed at (0, 0). Then it
+// is the JPEG's own size, which is the viewport's at the scale sessions run
+// at (1).
+func frameSize(ev *page.EventScreencastFrame) (float64, float64) {
+	if m := ev.Metadata; m != nil && m.DeviceWidth > 0 && m.DeviceHeight > 0 {
+		return m.DeviceWidth, m.DeviceHeight
+	}
+	b, err := base64.StdEncoding.DecodeString(ev.Data)
+	if err != nil {
+		return 0, 0
+	}
+	cfg, err := jpeg.DecodeConfig(bytes.NewReader(b))
+	if err != nil {
+		return 0, 0
+	}
+	return float64(cfg.Width), float64(cfg.Height)
 }
 
 func (v *caster) sendTabs() {
@@ -435,7 +460,11 @@ body { display:flex; flex-direction:column }
     }
   };
   const mods = e => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
-  const at = e => { const r = screen.getBoundingClientRect(); return {x: (e.clientX - r.left) * fw / r.width, y: (e.clientY - r.top) * fh / r.height}; };
+  // The frame's size in page pixels; the image's own when none came with it.
+  const at = e => {
+    const r = screen.getBoundingClientRect(), w = fw || screen.naturalWidth, h = fh || screen.naturalHeight;
+    return {x: (e.clientX - r.left) * w / r.width, y: (e.clientY - r.top) * h / r.height};
+  };
   const btn = b => ['left', 'middle', 'right', 'back', 'forward'][b] || 'none';
   const mouse = (type, e) => { const p = at(e); send({t: 'mouse', type, x: p.x, y: p.y, button: btn(e.button), buttons: e.buttons, clickCount: e.detail || 1, modifiers: mods(e)}); };
   screen.addEventListener('mousedown', e => { e.preventDefault(); stage.focus(); mouse('mousePressed', e); });
