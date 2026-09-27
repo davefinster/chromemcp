@@ -8,9 +8,10 @@
 #
 # Each ecosystem is grouped into a single pull request, because the point
 # is to be told that something moved, not to review three bumps
-# separately. Note that this repository runs no checks on pull requests —
-# the docker workflow builds on push to main — so a Dependabot pull
-# request arrives unverified and is worth a local build before merging.
+# separately. ci.yml tests and builds the image on every pull request,
+# Dependabot's included; what it cannot check is docker.yml itself, which
+# only runs on push to main, so the first build after an actions bump is
+# the test of that bump.
 version: 2
 updates:
   # The pinned actions in .github/workflows.
@@ -35,7 +36,7 @@ updates:
         patterns: ["*"]
     open-pull-requests-limit: 3
 
-  # The image's two bases, golang:1.26-alpine and debian:trixie-slim. Both
+  # The image's two bases, golang:1.27-alpine and debian:trixie-slim. Both
   # tags already float, so they collect patches on every rebuild without
   # help; what this catches is the deliberate move — a new Go minor, a new
   # Debian release — which is a decision rather than an upgrade. Drop this
