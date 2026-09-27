@@ -524,6 +524,21 @@ server ── mutual TLS ──▶ tailscale serve --tcp 9310 ──▶ chromemc
   and brings the one it shows to the front. It cannot reach what the page
   never sees: a native dialog, a passkey on the machine's own authenticator.
   Any session without a display gets one, headless sessions here included.
+- **`disable_passkeys` for a session someone will sign in through.** A
+  security-key or passkey request opens the browser's own WebAuthn dialog,
+  which no live view can show, and which on a Mac node holds the page's
+  input while it waits (Google's 2-Step Verification, "Try another way"
+  unclickable). With `session_start disable_passkeys=true` the session's
+  pages see no WebAuthn at all (`passkeys.go`: no `PublicKeyCredential`,
+  `navigator.credentials` refusing any `publicKey` request at once), so the
+  site offers its other methods. Opt-in, because a Chrome without WebAuthn
+  is itself unusual.
+- **Forgotten sessions are reaped on the node.** The server deletes a
+  session it is done with, but one whose record it lost (its sessions
+  directory is scratch space, gone with the pod) would keep its profile —
+  logins included — on the node for good. The node marks each session on
+  every call about it and deletes those untouched for `-max-age` (72h, well
+  beyond the server's own day).
 - **Identities cross over as profile archives.** `session_start identity=`
   on a node sends the identity's profile there (a gzipped tar, minus the
   caches `copyProfile` skips; unpacked only as plain files beneath the
@@ -564,7 +579,7 @@ to get right: a `pass out` for loopback 9300–9309 so it can reach its own
 Chrome, and a `pass in … keep state` for loopback 9300–9310, because `user`
 matches the *sending* socket and the replies from its own listeners would
 otherwise meet the block. `chromemcp node -h` lists the rest: `-ports`,
-`-max-running` (default 1), `-sessions-dir` (`~/Library/Caches/chromemcp-node`).
+`-max-running` (default 1), `-max-age` (72h), `-sessions-dir` (`~/Library/Caches/chromemcp-node`).
 
 The binary comes from the repository's releases: every `v*` tag attaches
 `chromemcp-darwin-arm64` (and darwin/amd64, linux/amd64, linux/arm64) with a

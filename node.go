@@ -63,6 +63,7 @@ type nodeConfig struct {
 	PortLow         int // DevTools ports, inclusive
 	PortHigh        int
 	MaxRunning      int
+	MaxAge          time.Duration // a session untouched this long is deleted (reap); 0 keeps them
 	DisableFeatures []string
 	AllowClients    []string // client certificate names admitted; empty admits any the CA signed
 	Verbose         bool
@@ -189,6 +190,7 @@ func node(args []string) int {
 		sessionsDir = fs.String("sessions-dir", env("CHROMEMCP_NODE_SESSIONS_DIR", defaultNodeSessionsDir()), "where session profiles and files live (env CHROMEMCP_NODE_SESSIONS_DIR)")
 		ports       = fs.String("ports", env("CHROMEMCP_NODE_PORTS", "9300-9309"), "DevTools port range, LOW-HIGH; the firewall must let this account reach them on loopback (env CHROMEMCP_NODE_PORTS)")
 		maxRunning  = fs.Int("max-running", envInt("CHROMEMCP_NODE_MAX_RUNNING", 1), "most Chrome instances alive at once (env CHROMEMCP_NODE_MAX_RUNNING)")
+		maxAge      = fs.Duration("max-age", envDuration("CHROMEMCP_NODE_MAX_AGE", 72*time.Hour), "delete a session nothing has touched for this long -- a backstop for sessions the server forgot, beyond its own -max-age; 0 disables (env CHROMEMCP_NODE_MAX_AGE)")
 		features    = fs.String("disable-features", env("CHROMEMCP_NODE_DISABLE_FEATURES", defFeatures), "comma-separated Chrome features to turn off (env CHROMEMCP_NODE_DISABLE_FEATURES)")
 		verbose     = fs.Bool("verbose", false, "log Chrome's stderr")
 	)
@@ -222,7 +224,7 @@ func node(args []string) int {
 	syscall.Umask(0o077)
 	ns, err := newNodeServer(&nodeConfig{
 		SessionsDir: *sessionsDir, Chrome: *chromePath, PortLow: lo, PortHigh: hi,
-		MaxRunning: max(*maxRunning, 1), DisableFeatures: disabled, AllowClients: allowed, Verbose: *verbose,
+		MaxRunning: max(*maxRunning, 1), MaxAge: *maxAge, DisableFeatures: disabled, AllowClients: allowed, Verbose: *verbose,
 	})
 	if err != nil {
 		die(err)
@@ -233,6 +235,7 @@ func node(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go ns.reaper(ctx)
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		die(err)
@@ -371,6 +374,76 @@ func (ns *nodeServer) withID(h func(http.ResponseWriter, *http.Request, string))
 			return
 		}
 		h(w, r, id)
+		ns.touch(id)
+	}
+}
+
+// lastUsedFile is how recently the server did anything with a session: its
+// modification time, set on every call about the session (a running one is
+// asked after every minute or so, by the server's wait).
+const lastUsedFile = ".last-used"
+
+// touch marks the session used, if it still has a directory here.
+func (ns *nodeServer) touch(id string) {
+	dir := ns.sessionDir(id)
+	if _, err := os.Stat(dir); err != nil {
+		return
+	}
+	p := filepath.Join(dir, lastUsedFile)
+	now := time.Now()
+	if err := os.Chtimes(p, now, now); errors.Is(err, os.ErrNotExist) {
+		os.WriteFile(p, nil, 0o600)
+	}
+}
+
+// reaper deletes the sessions nobody has touched for MaxAge, hourly and
+// once at start. The server deletes a session it is done with itself (a day
+// unused, by default), so what this finds are the ones it forgot -- a server
+// whose own session directory did not survive a restart, and so no longer
+// knows the session exists -- which would otherwise keep their profiles,
+// logins included, on this machine for good.
+func (ns *nodeServer) reaper(ctx context.Context) {
+	if ns.cfg.MaxAge <= 0 {
+		return
+	}
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		ns.reap(time.Now())
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func (ns *nodeServer) reap(now time.Time) {
+	entries, err := os.ReadDir(ns.cfg.SessionsDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		id := e.Name()
+		if !e.IsDir() || !nodeSessionIDRe.MatchString(id) || ns.running(id) != nil {
+			continue
+		}
+		dir := ns.sessionDir(id)
+		fi, err := os.Stat(filepath.Join(dir, lastUsedFile))
+		if err != nil {
+			fi, err = os.Stat(dir)
+		}
+		if err != nil || now.Sub(fi.ModTime()) < ns.cfg.MaxAge {
+			continue
+		}
+		ns.mu.Lock()
+		delete(ns.sessions, id)
+		ns.mu.Unlock()
+		if err := os.RemoveAll(dir); err != nil {
+			logf("node: session %s: deleting it, unused since %s: %v", id, fi.ModTime().Format(time.RFC3339), err)
+			continue
+		}
+		logf("node: session %s: deleted, unused since %s", id, fi.ModTime().Format(time.RFC3339))
 	}
 }
 

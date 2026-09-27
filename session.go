@@ -70,21 +70,23 @@ type managerConfig struct {
 // sessionMeta is what survives in session.json: enough to list a parked
 // session and to relaunch it the way it was started.
 type sessionMeta struct {
-	ID        string    `json:"id"`
-	Label     string    `json:"label,omitempty"`
-	Mode      string    `json:"mode"`
-	Identity  string    `json:"identity,omitempty"`
-	Created   time.Time `json:"created"`
-	LastUsed  time.Time `json:"last_used"`
-	Width     int       `json:"width"`
-	Height    int       `json:"height"`
-	Device    string    `json:"device,omitempty"`   // device profile name (device.go), see deviceName
-	Timezone  string    `json:"timezone,omitempty"` // IANA zone Chrome runs in; "" is the server's
-	Locale    string    `json:"locale,omitempty"`   // Chrome's --lang; "" is the server's
-	Node      string    `json:"node,omitempty"`     // the node its Chrome runs on (remote.go); "" is this server
-	LastURL   string    `json:"last_url,omitempty"`
-	LastTitle string    `json:"last_title,omitempty"`
-	Tabs      []string  `json:"tabs,omitempty"` // URLs open when parked, reopened on resume
+	ID       string    `json:"id"`
+	Label    string    `json:"label,omitempty"`
+	Mode     string    `json:"mode"`
+	Identity string    `json:"identity,omitempty"`
+	Created  time.Time `json:"created"`
+	LastUsed time.Time `json:"last_used"`
+	Width    int       `json:"width"`
+	Height   int       `json:"height"`
+	Device   string    `json:"device,omitempty"`   // device profile name (device.go), see deviceName
+	Timezone string    `json:"timezone,omitempty"` // IANA zone Chrome runs in; "" is the server's
+	Locale   string    `json:"locale,omitempty"`   // Chrome's --lang; "" is the server's
+	Node     string    `json:"node,omitempty"`     // the node its Chrome runs on (remote.go); "" is this server
+	// NoPasskeys hides WebAuthn from the session's pages (passkeys.go).
+	NoPasskeys bool     `json:"no_passkeys,omitempty"`
+	LastURL    string   `json:"last_url,omitempty"`
+	LastTitle  string   `json:"last_title,omitempty"`
+	Tabs       []string `json:"tabs,omitempty"` // URLs open when parked, reopened on resume
 }
 
 type session struct {
@@ -247,14 +249,15 @@ func newSessionID() string {
 }
 
 type startOptions struct {
-	Mode     string
-	Identity string
-	Label    string
-	Width    int
-	Height   int
-	Device   string
-	Timezone string
-	Locale   string
+	Mode       string
+	Identity   string
+	Label      string
+	Width      int
+	Height     int
+	Device     string
+	Timezone   string
+	Locale     string
+	NoPasskeys bool
 }
 
 var localeRe = regexp.MustCompile(`^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`)
@@ -314,7 +317,7 @@ func (m *manager) start(ctx context.Context, o startOptions) (*session, error) {
 	s := &session{mgr: m, dir: dir, meta: sessionMeta{
 		ID: id, Label: o.Label, Mode: o.Mode, Identity: o.Identity,
 		Created: now, LastUsed: now, Width: o.Width, Height: o.Height,
-		Device: o.Device, Timezone: o.Timezone, Locale: o.Locale,
+		Device: o.Device, Timezone: o.Timezone, Locale: o.Locale, NoPasskeys: o.NoPasskeys,
 	}}
 	if node != nil {
 		s.meta.Node = node.name
@@ -395,6 +398,9 @@ func (m *sessionMeta) deviceSuffix() string {
 	}
 	if m.Locale != "" {
 		parts = append(parts, "locale "+m.Locale)
+	}
+	if m.NoPasskeys {
+		parts = append(parts, "passkeys hidden")
 	}
 	if len(parts) == 0 {
 		return ""
@@ -767,7 +773,7 @@ func (s *session) launch(ctx context.Context) error {
 	emu, err := startEmulator(ctx, proc.wsURL(), &emulationSpec{
 		UserAgent: dev.userAgentOverride(ver),
 		Metrics:   dev.metrics(w, h, s.meta.Mode == modeHeadless),
-		Script:    dev.initScript(ver),
+		Script:    s.initScript(dev, ver),
 		CHHeaders: dev.clientHintHeaders(ver),
 	}, logf)
 	if err != nil {
@@ -855,6 +861,16 @@ func (s *session) launch(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// initScript is what runs in every document before the page's own scripts:
+// the device profile's, and the passkey switch's when the session has it.
+func (s *session) initScript(dev *deviceProfile, ver chromeVersion) string {
+	script := dev.initScript(ver)
+	if s.meta.NoPasskeys {
+		script += "\n" + noPasskeysScript
+	}
+	return script
 }
 
 // park closes Chrome (and the display) and keeps the profile. Caller holds
