@@ -37,6 +37,13 @@ jobs:
             echo "not gofmt'd:"; echo "$unformatted"; exit 1
           fi
       - run: go vet ./...
+      - name: darwin build
+        # `chromemcp node` runs on a Mac (README: Nodes), which none of the
+        # images are; keep it compiling there.
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+        run: go vet ./... && go build -o /dev/null .
       - name: go test
         # The integration tests drive a real Chrome against the image's own
         # fonts and an Xvnc, neither of which a bare runner has — the device

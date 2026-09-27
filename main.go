@@ -12,6 +12,9 @@
 //	  -identities-dir /data/identities
 //	chromemcp serve -http 127.0.0.1:8787              local, no auth
 //	chromemcp serve                                   stdio (Claude Code, etc.)
+//	chromemcp serve ... -node mac=https://mac:9310 \   with sessions on a Mac node
+//	  -node-cert c.pem -node-key k.pem -node-ca ca.pem
+//	chromemcp node -tls-cert ... -client-ca ...       the node itself (node.go)
 package main
 
 import (
@@ -91,6 +94,8 @@ func main() {
 	switch cmd {
 	case "serve":
 		os.Exit(serve(rest))
+	case "node":
+		os.Exit(node(rest))
 	case "version":
 		fmt.Println("chromemcp", version)
 	default:
@@ -106,6 +111,7 @@ usage: chromemcp <command> [flags]
 
 commands:
   serve        run the MCP server            chromemcp serve -http :8787 ...
+  node         run Chrome sessions for a server, on another machine (a Mac)
   version      print the version
 
 `)
@@ -138,7 +144,16 @@ func defaultChrome() string {
 	if p := os.Getenv("CHROME_PATH"); p != "" {
 		return p
 	}
-	return findExe("google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome")
+	if p := findExe("google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome"); p != "" {
+		return p
+	}
+	if hostOS == "darwin" {
+		const mac = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+		if _, err := os.Stat(mac); err == nil {
+			return mac
+		}
+	}
+	return ""
 }
 
 func defaultXvnc() string {
@@ -192,8 +207,14 @@ func serve(args []string) int {
 		viewTTL    = fs.Duration("view-ttl", envDuration("CHROMEMCP_VIEW_TTL", 30*time.Minute), "how long a live-view link stays valid")
 		uploadTTL  = fs.Duration("upload-ttl", envDuration("CHROMEMCP_UPLOAD_TTL", time.Hour), "how long an upload link stays valid")
 		verbose    = fs.Bool("verbose", false, "log the MCP SDK and Chrome's stderr chatter")
+
+		nodes    multiFlag
+		nodeCert = fs.String("node-cert", env("CHROMEMCP_NODE_CERT", ""), "client certificate this server presents to its nodes, PEM; re-read when it changes (env CHROMEMCP_NODE_CERT)")
+		nodeKey  = fs.String("node-key", env("CHROMEMCP_NODE_KEY", ""), "its key (env CHROMEMCP_NODE_KEY)")
+		nodeCA   = fs.String("node-ca", env("CHROMEMCP_NODE_CA", ""), "the CA nodes' certificates must chain to, PEM (env CHROMEMCP_NODE_CA)")
 	)
 	fs.Var(&chromeFlags, "chrome-flag", "extra Chrome command-line flag (repeatable; env CHROMEMCP_CHROME_FLAGS, space-separated)")
+	fs.Var(&nodes, "node", "a node that runs sessions this server cannot, NAME=https://host:port (repeatable; env CHROMEMCP_NODES, space-separated)")
 	fs.Parse(args)
 
 	var oauthCfg *oauthConfig
@@ -232,6 +253,33 @@ func serve(args []string) int {
 		base = "http://" + host + ":" + port
 	}
 
+	nodeSpecs := []string(nodes)
+	if len(nodeSpecs) == 0 {
+		nodeSpecs = strings.Fields(os.Getenv("CHROMEMCP_NODES"))
+	}
+	var nodeClients []*nodeClient
+	if len(nodeSpecs) > 0 {
+		if *nodeCert == "" || *nodeKey == "" || *nodeCA == "" {
+			die(errors.New("-node needs -node-cert, -node-key and -node-ca: nodes speak mutual TLS only"))
+		}
+		tlsCfg, err := clientTLS(*nodeCert, *nodeKey, *nodeCA)
+		if err != nil {
+			die(fmt.Errorf("node tls: %w", err))
+		}
+		for _, spec := range nodeSpecs {
+			name, u, err := parseNodeFlag(spec)
+			if err != nil {
+				die(err)
+			}
+			n, err := newNodeClient(name, u, tlsCfg)
+			if err != nil {
+				die(err)
+			}
+			nodeClients = append(nodeClients, n)
+			logf("node %s at %s", name, u)
+		}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -251,6 +299,7 @@ func serve(args []string) int {
 		ViewTTL:       *viewTTL,
 		UploadTTL:     *uploadTTL,
 		ViewBase:      strings.TrimSuffix(base, "/"),
+		Nodes:         nodeClients,
 		Verbose:       *verbose,
 	})
 	if err != nil {
