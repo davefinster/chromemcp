@@ -212,6 +212,8 @@ type sessionStartIn struct {
 	Timezone string `json:"timezone,omitempty" jsonschema:"IANA time zone the browser runs in, e.g. Europe/London or Australia/Sydney (default: the zone of the machine Chrome runs on -- this server's own, which is UTC in a stock container unless the deployment sets TZ; for device=mac, the Mac's)"`
 	Locale   string `json:"locale,omitempty" jsonschema:"browser language as a tag, e.g. en-US, en-GB, de-DE: sets Accept-Language, navigator.language and the Intl defaults (default: the language of the machine Chrome runs on -- this server's, en-US in a stock container; for device=mac, the Mac account's)"`
 	URL      string `json:"url,omitempty" jsonschema:"open this URL right away"`
+	// DisablePasskeys is passkeys.go's switch.
+	DisablePasskeys bool `json:"disable_passkeys,omitempty" jsonschema:"hide passkeys and security keys (WebAuthn) from sites for this session, so a sign-in offers its other methods -- a phone prompt, a code -- and never opens the browser's own security-key dialog, which a live view cannot show or answer. Use it for a session the owner will sign in through (session_view)"`
 }
 
 type sessionIn struct {
@@ -449,8 +451,8 @@ func (a *mcpApp) register(s *mcp.Server) {
 		Description: "A live-view link: a web page showing that Chrome, with mouse and keyboard, for a person to open. " +
 			"Give it to the owner when they need to log in to an account (then identity_save), solve a captcha, or watch. " +
 			"Any session has one; a headful one is what to start for a login, since it looks like an ordinary browser to the site. " +
-			"A security-key or passkey prompt is the browser's own dialog, which no live view can show or answer: " +
-			"tell the owner to choose another way on the page (a phone prompt or a code). " +
+			"A security-key or passkey prompt is the browser's own dialog, which no live view can show or answer, and it can hold the page's input " +
+			"while it waits: for a session the owner will sign in through, start it with disable_passkeys=true so the site offers its other methods. " +
 			"The link expires; ask again for a new one.",
 		Annotations: acts("Live-view link"),
 	}, a.sessionView)
@@ -638,7 +640,8 @@ func (a *mcpApp) register(s *mcp.Server) {
 // ---- session tools ----
 
 func (a *mcpApp) sessionStart(ctx context.Context, req *mcp.CallToolRequest, in sessionStartIn) (*mcp.CallToolResult, any, error) {
-	o := startOptions{Mode: in.Mode, Identity: in.Identity, Label: in.Label, Device: in.Device, Timezone: in.Timezone, Locale: in.Locale}
+	o := startOptions{Mode: in.Mode, Identity: in.Identity, Label: in.Label, Device: in.Device, Timezone: in.Timezone, Locale: in.Locale,
+		NoPasskeys: in.DisablePasskeys}
 	if in.Viewport != "" {
 		w, h, err := parseViewport(in.Viewport)
 		if err != nil {
@@ -656,6 +659,9 @@ func (a *mcpApp) sessionStart(ctx context.Context, req *mcp.CallToolRequest, in 
 		if d, err := lookupDevice(s.meta.Device); err == nil {
 			r.addf("sites see %s.", d.Description)
 		}
+	}
+	if s.meta.NoPasskeys {
+		r.addf("passkeys and security keys are hidden from sites in this session: a sign-in will offer its other methods.")
 	}
 	if s.meta.Identity != "" {
 		if im, err := a.mgr.identities.get(s.meta.Identity); err == nil && im.Device != "" && im.Device != s.meta.deviceName() {

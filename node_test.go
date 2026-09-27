@@ -543,3 +543,49 @@ func TestNodeSessionIntegration(t *testing.T) {
 		t.Errorf("session directory left on the node: %v", err)
 	}
 }
+
+// The node deletes the sessions nothing has touched for its max age -- the
+// ones a server forgot -- and nothing else.
+func TestNodeReaper(t *testing.T) {
+	dir := t.TempDir()
+	ns, err := newNodeServer(&nodeConfig{SessionsDir: dir, Chrome: "/nonexistent", PortLow: 9300, PortHigh: 9309, MaxRunning: 1, MaxAge: 72 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-100 * time.Hour)
+	mk := func(name string) string {
+		p := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Join(p, "profile"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	forgotten := mk("s-00000001")
+	os.WriteFile(filepath.Join(forgotten, lastUsedFile), nil, 0o600)
+	os.Chtimes(filepath.Join(forgotten, lastUsedFile), old, old)
+	noMarker := mk("s-00000002") // from before .last-used: the directory's own time
+	os.Chtimes(noMarker, old, old)
+	recent := mk("s-00000003")
+	ns.touch("s-00000003")
+	other := mk("not-a-session")
+	os.Chtimes(other, old, old)
+
+	ns.reap(time.Now())
+	for p, want := range map[string]bool{forgotten: false, noMarker: false, recent: true, other: true} {
+		if _, err := os.Stat(p); (err == nil) != want {
+			t.Errorf("%s: exists=%v, want %v", filepath.Base(p), err == nil, want)
+		}
+	}
+	// A touch keeps a session that would otherwise have aged out.
+	os.Chtimes(filepath.Join(recent, lastUsedFile), old, old)
+	ns.touch("s-00000003")
+	ns.reap(time.Now())
+	if _, err := os.Stat(recent); err != nil {
+		t.Error("a session touched just now was reaped")
+	}
+	// And touching a session that has no directory makes none.
+	ns.touch("s-00000009")
+	if _, err := os.Stat(filepath.Join(dir, "s-00000009")); err == nil {
+		t.Error("touch created a session directory")
+	}
+}
