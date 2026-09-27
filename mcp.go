@@ -449,6 +449,8 @@ func (a *mcpApp) register(s *mcp.Server) {
 		Description: "A live-view link: a web page showing that Chrome, with mouse and keyboard, for a person to open. " +
 			"Give it to the owner when they need to log in to an account (then identity_save), solve a captcha, or watch. " +
 			"Any session has one; a headful one is what to start for a login, since it looks like an ordinary browser to the site. " +
+			"A security-key or passkey prompt is the browser's own dialog, which no live view can show or answer: " +
+			"tell the owner to choose another way on the page (a phone prompt or a code). " +
 			"The link expires; ask again for a new one.",
 		Annotations: acts("Live-view link"),
 	}, a.sessionView)
