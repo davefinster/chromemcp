@@ -14,6 +14,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -161,8 +162,19 @@ const crdownload = ".crdownload"
 func (s *session) listPutFiles() ([]sessionFile, error) { return listFileDir(s.filesDir(), false) }
 
 // listDownloads is what Chrome has downloaded into the session, the ones
-// still arriving included.
-func (s *session) listDownloads() ([]sessionFile, error) { return listFileDir(s.downloadsDir(), true) }
+// still arriving included. A session on a node downloads there.
+func (s *session) listDownloads() ([]sessionFile, error) {
+	n, err := s.remote()
+	if err != nil {
+		return nil, err
+	}
+	if n != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return n.listDownloads(ctx, s.meta.ID)
+	}
+	return listFileDir(s.downloadsDir(), true)
+}
 
 // listFiles is everything the session could hand a page, both kinds at
 // once, sorted by name.
@@ -422,10 +434,27 @@ func (s *session) deleteFile(name string) error {
 	if err != nil {
 		return err
 	}
+	n, err := s.remote()
+	if err != nil {
+		return err
+	}
 	for _, f := range have {
-		if f.Name == name {
+		if f.Name != name {
+			continue
+		}
+		if n == nil {
 			return os.Remove(f.path)
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if f.Downloaded {
+			return n.deleteDownload(ctx, s.meta.ID, name)
+		}
+		// The original is here; the node may hold the copy a page was given.
+		if err := n.deleteFile(ctx, s.meta.ID, name); err != nil {
+			logf("session %s: deleting the copy of %q on node %s: %v", s.meta.ID, name, n.name, err)
+		}
+		return os.Remove(f.path)
 	}
 	return fmt.Errorf("session %s has no file %q (file_list shows what it holds)", s.meta.ID, name)
 }
@@ -434,8 +463,16 @@ func (s *session) deleteFile(name string) error {
 // when an input is set. Order is kept: it is the order the input will hold
 // them in. A name is only ever resolved through a listing, so nothing an
 // agent passes is joined onto a directory.
+//
+// Chrome opens them on its own machine, so for a session on a node a put
+// file is copied there first and the path is the copy's; a download is
+// already there.
 func (s *session) filePaths(names []string) ([]string, error) {
 	have, err := s.listFiles()
+	if err != nil {
+		return nil, err
+	}
+	node, err := s.remote()
 	if err != nil {
 		return nil, err
 	}
@@ -453,6 +490,14 @@ func (s *session) filePaths(names []string) ([]string, error) {
 		}
 		if f.Partial {
 			return nil, fmt.Errorf("%q is still downloading (%s so far); wait for it to finish — file_list shows when it has", n, humanBytes(f.Size))
+		}
+		if node != nil && !f.Downloaded {
+			p, err := s.pushFile(node, f)
+			if err != nil {
+				return nil, fmt.Errorf("copying %q to node %s: %w", n, node.name, err)
+			}
+			out = append(out, p)
+			continue
 		}
 		out = append(out, f.path)
 	}

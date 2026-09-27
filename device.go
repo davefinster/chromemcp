@@ -32,6 +32,12 @@ var fingerprintScript string
 type deviceProfile struct {
 	Name        string
 	Description string
+	// OS, when set, makes the profile a real machine's rather than an
+	// emulation: sessions with it run on a node of that operating system
+	// (Go's name for it, "darwin"), or here if this server is one. The user
+	// agent and client hints then describe what that machine's Chrome is,
+	// minus the headless tells; GPU, fonts and hardware are its own.
+	OS string
 	// UserAgent is the user agent string with the Chrome major version
 	// substituted for %s. Chrome's reduced UA carries only the major.
 	UserAgent string
@@ -59,6 +65,9 @@ type deviceProfile struct {
 	// TaskbarHeight is the pixels a desktop reserves from screen.availHeight
 	// (a real Windows taskbar); 0 leaves availHeight == height.
 	TaskbarHeight int
+	// MenuBarHeight is the pixels a desktop reserves at the top of the
+	// screen (the macOS menu bar): screen.availTop, and less availHeight.
+	MenuBarHeight int
 	// Pointer is what the pointer/hover media queries answer: "fine" (a
 	// mouse: pointer fine, hover hover) or "coarse" (a touchscreen). "" is
 	// Chrome's own answer, which without an input device is none.
@@ -89,6 +98,26 @@ const (
 
 // deviceProfiles is the registry, by name.
 var deviceProfiles = map[string]*deviceProfile{
+	"mac": {
+		Name:        "mac",
+		Description: "a real Mac with Apple silicon running Chrome on macOS, on a node: its own GPU, fonts and hardware, a 1920x1080 display at 100%; headless, no identities yet",
+		OS:          "darwin",
+		// Chrome's frozen macOS UA: "Intel Mac OS X 10_15_7" on every Mac,
+		// Apple silicon included. The headless build says HeadlessChrome.
+		UserAgent:  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s.0.0.0 Safari/537.36",
+		Platform:   "MacIntel",
+		CHPlatform: "macOS",
+		// CHPlatformVersion is left to the node: the machine's macOS.
+		CHArchitecture: "arm",
+		CHBitness:      "64",
+		CHFormFactors:  []string{"Desktop"},
+		// A Mac mini on an ordinary monitor. Memory and cores are the
+		// machine's own, and real (a Mac reports at most the spec's 8 GB).
+		ScreenWidth:   1920,
+		ScreenHeight:  1080,
+		Scale:         1,
+		MenuBarHeight: 25,
+	},
 	nativeDevice: {
 		Name:        nativeDevice,
 		Description: "this server's own Chrome, as it is: Linux, no emulation",
@@ -135,6 +164,22 @@ var deviceProfiles = map[string]*deviceProfile{
 			"math":      "Cambria Math",
 		},
 	},
+}
+
+// deviceNames is every profile this server can run: those that are
+// emulations, and those that are real machines it is one of or has a node
+// for. A node's operating system is only known once it answers, so any
+// configured node offers the real-machine profiles; session_start says so
+// if none of them turns out to be that machine.
+func (m *manager) deviceNames() []string {
+	var names []string
+	for _, n := range deviceNames() {
+		d := deviceProfiles[n]
+		if d.OS == "" || d.OS == hostOS || len(m.cfg.Nodes) > 0 {
+			names = append(names, n)
+		}
+	}
+	return names
 }
 
 func deviceNames() []string {
@@ -364,6 +409,7 @@ func (d *deviceProfile) initScript(ver chromeVersion) string {
 		"deviceMemory":        d.DeviceMemory,        // 0: leave Chrome's
 		"hardwareConcurrency": d.HardwareConcurrency, // 0: leave Chrome's
 		"taskbar":             d.TaskbarHeight,       // 0: leave availHeight == height
+		"menubar":             d.MenuBarHeight,       // 0: availTop 0
 	})
 	return fmt.Sprintf(deviceInitScript, string(b))
 }
@@ -417,15 +463,17 @@ const deviceInitScript = `(() => {
   // available height is a little less than the screen height. Emulated
   // device metrics leave them equal (no taskbar), which reads as "no real
   // desktop"; reserve the taskbar and keep availWidth == width, avail top/left 0.
-  if (typeof Screen !== 'undefined' && P.taskbar) {
-    getter(Screen.prototype, 'availHeight', function () { return Math.max(0, this.height - P.taskbar); });
+  // A Mac reserves its menu bar at the top instead: availTop is its height.
+  if (typeof Screen !== 'undefined' && (P.taskbar || P.menubar)) {
+    getter(Screen.prototype, 'availHeight', function () { return Math.max(0, this.height - P.taskbar - P.menubar); });
     getter(Screen.prototype, 'availWidth', function () { return this.width; });
-    getter(Screen.prototype, 'availTop', function () { return 0; });
+    getter(Screen.prototype, 'availTop', function () { return P.menubar; });
     getter(Screen.prototype, 'availLeft', function () { return 0; });
   }
   // WEBGL_debug_renderer_info: the GPU strings, only where the real
-  // getParameter would have answered (the extension must be enabled).
-  for (const C of [self.WebGLRenderingContext, self.WebGL2RenderingContext]) {
+  // getParameter would have answered (the extension must be enabled). A
+  // real machine's profile has a real GPU and leaves them alone.
+  for (const C of (P.vendor || P.renderer) ? [self.WebGLRenderingContext, self.WebGL2RenderingContext] : []) {
     if (!C) continue;
     const orig = C.prototype.getParameter;
     C.prototype.getParameter = mask(function (pname) {

@@ -62,7 +62,8 @@ type managerConfig struct {
 	MaxRunning    int
 	ViewTTL       time.Duration
 	UploadTTL     time.Duration
-	ViewBase      string // base URL for the links this server hands out: live views and uploads
+	ViewBase      string        // base URL for the links this server hands out: live views and uploads
+	Nodes         []*nodeClient // machines that run sessions for devices this one cannot (remote.go)
 	Verbose       bool
 }
 
@@ -80,6 +81,7 @@ type sessionMeta struct {
 	Device    string    `json:"device,omitempty"`   // device profile name (device.go), see deviceName
 	Timezone  string    `json:"timezone,omitempty"` // IANA zone Chrome runs in; "" is the server's
 	Locale    string    `json:"locale,omitempty"`   // Chrome's --lang; "" is the server's
+	Node      string    `json:"node,omitempty"`     // the node its Chrome runs on (remote.go); "" is this server
 	LastURL   string    `json:"last_url,omitempty"`
 	LastTitle string    `json:"last_title,omitempty"`
 	Tabs      []string  `json:"tabs,omitempty"` // URLs open when parked, reopened on resume
@@ -94,7 +96,7 @@ type session struct {
 	// action at a time, and the tab table is only touched under it.
 	mu sync.Mutex
 
-	chrome     *chromeProc
+	chrome     chromeHandle // a local chromeProc, or a remoteChrome on a node
 	disp       *display
 	emu        *emulator
 	allocCtx   context.Context
@@ -264,9 +266,6 @@ func (m *manager) start(ctx context.Context, o startOptions) (*session, error) {
 	case "", modeHeadless:
 		o.Mode = modeHeadless
 	case modeHeadful:
-		if m.cfg.Xvnc == "" {
-			return nil, errors.New("headful sessions are unavailable on this server (no Xvnc); use mode \"headless\"")
-		}
 	default:
 		return nil, fmt.Errorf("mode %q: want headless or headful", o.Mode)
 	}
@@ -288,6 +287,20 @@ func (m *manager) start(ctx context.Context, o startOptions) (*session, error) {
 	// Recorded by name, so the session keeps the profile it was started with
 	// whatever the default becomes.
 	o.Device = dev.Name
+	node, err := m.placeDevice(ctx, dev)
+	if err != nil {
+		return nil, err
+	}
+	if node != nil {
+		if o.Mode == modeHeadful {
+			return nil, fmt.Errorf("device %s runs on node %s, headless only: a node has no display to give a live view of", dev.Name, node.name)
+		}
+		if o.Identity != "" {
+			return nil, fmt.Errorf("device %s runs on node %s, where identities are not supported yet", dev.Name, node.name)
+		}
+	} else if o.Mode == modeHeadful && m.cfg.Xvnc == "" {
+		return nil, errors.New("headful sessions are unavailable on this server (no Xvnc); use mode \"headless\"")
+	}
 	if o.Timezone != "" {
 		if _, err := time.LoadLocation(o.Timezone); err != nil {
 			return nil, fmt.Errorf("timezone %q: want an IANA zone such as Europe/London or Australia/Sydney", o.Timezone)
@@ -308,6 +321,9 @@ func (m *manager) start(ctx context.Context, o startOptions) (*session, error) {
 		Created: now, LastUsed: now, Width: o.Width, Height: o.Height,
 		Device: o.Device, Timezone: o.Timezone, Locale: o.Locale,
 	}}
+	if node != nil {
+		s.meta.Node = node.name
+	}
 	s.lastUsed.Store(now.UnixNano())
 	if o.Identity != "" {
 		if err := m.identities.seed(o.Identity, s.dir); err != nil {
@@ -320,10 +336,13 @@ func (m *manager) start(ctx context.Context, o startOptions) (*session, error) {
 		return nil, err
 	}
 
-	m.makeRoom(id)
+	m.makeRoom(id, s.meta.Node)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.launch(ctx); err != nil {
+		if node != nil {
+			node.remove(context.Background(), id)
+		}
 		os.RemoveAll(dir)
 		return nil, err
 	}
@@ -332,6 +351,13 @@ func (m *manager) start(ctx context.Context, o startOptions) (*session, error) {
 	m.mu.Unlock()
 	logf("session %s: started (%s%s%s)", id, o.Mode, identitySuffix(o.Identity), s.meta.deviceSuffix())
 	return s, nil
+}
+
+func nodeSuffix(node string) string {
+	if node == "" {
+		return ""
+	}
+	return " on node " + node
 }
 
 func identitySuffix(identity string) string {
@@ -355,6 +381,9 @@ func (m *sessionMeta) deviceName() string {
 // timezone Europe/London".
 func (m *sessionMeta) deviceSuffix() string {
 	parts := []string{"device " + m.deviceName()}
+	if m.Node != "" {
+		parts = append(parts, "on node "+m.Node)
+	}
 	if m.Timezone != "" {
 		parts = append(parts, "timezone "+m.Timezone)
 	}
@@ -390,7 +419,7 @@ func (m *manager) running(ctx context.Context, id string) (*session, error) {
 	if s.isRunning() {
 		return s, nil
 	}
-	m.makeRoom(id)
+	m.makeRoom(id, s.meta.Node)
 	if err := s.launch(ctx); err != nil {
 		return nil, fmt.Errorf("resuming session %s: %w", id, err)
 	}
@@ -399,26 +428,31 @@ func (m *manager) running(ctx context.Context, id string) (*session, error) {
 }
 
 // makeRoom parks least-recently-used sessions until one more Chrome fits
-// under MaxRunning. keep is the session about to run and is never parked.
-func (m *manager) makeRoom(keep string) {
-	if m.cfg.MaxRunning <= 0 {
+// on the machine it will run on: under MaxRunning here, or under a node's
+// own limit there. keep is the session about to run and is never parked.
+func (m *manager) makeRoom(keep, node string) {
+	limit := m.cfg.MaxRunning
+	if n := m.node(node); n != nil {
+		limit = n.maxRunning()
+	}
+	if limit <= 0 {
 		return
 	}
 	for {
 		var running []*session
 		m.mu.Lock()
 		for _, s := range m.sessions {
-			if s.meta.ID != keep && s.isRunningQuick() {
+			if s.meta.ID != keep && s.meta.Node == node && s.isRunningQuick() {
 				running = append(running, s)
 			}
 		}
 		m.mu.Unlock()
-		if len(running) < m.cfg.MaxRunning {
+		if len(running) < limit {
 			return
 		}
 		sort.Slice(running, func(i, j int) bool { return running[i].lastUsed.Load() < running[j].lastUsed.Load() })
 		victim := running[0]
-		logf("session %s: parking to make room (max-running %d)", victim.meta.ID, m.cfg.MaxRunning)
+		logf("session %s: parking to make room (at most %d running%s)", victim.meta.ID, limit, nodeSuffix(node))
 		victim.mu.Lock()
 		victim.park()
 		victim.mu.Unlock()
@@ -450,6 +484,14 @@ func (m *manager) remove(id string) error {
 	m.mu.Unlock()
 	m.views.revokeSession(id)
 	m.uploads.revokeSession(id)
+	if n := m.node(s.meta.Node); n != nil {
+		// The profile and files there; a node that cannot be reached keeps
+		// them until it next can be (its own sessions directory is the place
+		// to look).
+		if err := n.remove(context.Background(), id); err != nil {
+			logf("session %s: deleting it on node %s: %v", id, n.name, err)
+		}
+	}
 	if err := os.RemoveAll(s.dir); err != nil {
 		return err
 	}
@@ -602,9 +644,39 @@ func (s *session) launch(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	node, err := s.remote()
+	if err != nil {
+		return err
+	}
+	var info *nodeInfo
+	if node != nil {
+		// Asked afresh at every launch: a Mac's Chrome updates itself, and
+		// the user agent must carry the version that is actually running.
+		if info, err = node.getInfo(ctx, 0); err != nil {
+			return err
+		}
+	}
+	if dev.OS != "" && dev.CHPlatformVersion == "" {
+		// A real machine's profile takes its OS version from the machine:
+		// the node's, or this one's when it is that machine itself.
+		v := osVersion()
+		if info != nil {
+			v = info.OSVersion
+		}
+		if v != "" {
+			d := *dev
+			d.CHPlatformVersion = platformVersion(v)
+			dev = &d
+		}
+	}
 	var ver chromeVersion
 	if dev.emulated() {
-		if ver, err = s.mgr.chromeVersion(); err != nil {
+		if node != nil {
+			ver, err = parseChromeVersion(info.Chrome)
+		} else {
+			ver, err = s.mgr.chromeVersion()
+		}
+		if err != nil {
 			return fmt.Errorf("device %s: %w", dev.Name, err)
 		}
 	}
@@ -628,16 +700,23 @@ func (s *session) launch(ctx context.Context) error {
 		Verbose:     cfg.Verbose,
 		Logf:        logf,
 	}
-	if fc, err := dev.fontsConfFile(cfg.SessionsDir, s.mgr.installedFonts()); err != nil {
-		logf("session %s: fonts configuration: %v", s.meta.ID, err)
-	} else if fc != "" {
-		l.Env = append(l.Env, "FONTCONFIG_FILE="+fc)
-	}
-	// The generic-family font defaults go into the profile's Preferences,
-	// where Blink reads them, before Chrome opens it. Merged, so an
-	// identity's own settings and a resumed profile's survive.
-	if err := mergeProfilePrefs(s.profileDir(), dev.fontPrefs()); err != nil {
-		logf("session %s: font preferences: %v", s.meta.ID, err)
+	if node != nil {
+		// A node builds its own command line; this server's -chrome-flag
+		// extras are for its own Chrome.
+		l.ExtraFlags = dev.chromeFlags(ver)
+	} else {
+		if fc, err := dev.fontsConfFile(cfg.SessionsDir, s.mgr.installedFonts()); err != nil {
+			logf("session %s: fonts configuration: %v", s.meta.ID, err)
+		} else if fc != "" {
+			l.Env = append(l.Env, "FONTCONFIG_FILE="+fc)
+		}
+		// The generic-family font defaults go into the profile's Preferences,
+		// where Blink reads them, before Chrome opens it. Merged, so an
+		// identity's own settings and a resumed profile's survive. (A node
+		// does this with the preferences it is sent.)
+		if err := mergeProfilePrefs(s.profileDir(), dev.fontPrefs()); err != nil {
+			logf("session %s: font preferences: %v", s.meta.ID, err)
+		}
 	}
 	if s.meta.Locale != "" {
 		flags, env := localeLaunch(s.meta.Locale)
@@ -653,16 +732,29 @@ func (s *session) launch(ctx context.Context) error {
 	} else if dev.emulated() {
 		l.Width, l.Height = w+windowFrameWidth, h+headfulChromeHeight
 	}
-	proc, err := launchChrome(ctx, l)
-	if err != nil {
-		if disp != nil {
-			disp.stop()
+	var proc chromeHandle
+	if node != nil {
+		rc, err := node.launch(ctx, s.meta.ID, &nodeLaunchRequest{
+			Headless: true, Width: l.Width, Height: l.Height,
+			Flags: l.ExtraFlags, Env: l.Env, Prefs: dev.fontPrefs(), Locale: s.meta.Locale,
+		})
+		if err != nil {
+			return err
 		}
-		return err
+		proc = rc
+	} else {
+		lc, err := launchChrome(ctx, l)
+		if err != nil {
+			if disp != nil {
+				disp.stop()
+			}
+			return err
+		}
+		proc = lc
 	}
 	// The device profile goes on before anything connects, so the first
 	// tab carries it from its first request.
-	emu, err := startEmulator(ctx, proc.WSURL, &emulationSpec{
+	emu, err := startEmulator(ctx, proc.wsURL(), &emulationSpec{
 		UserAgent: dev.userAgentOverride(ver),
 		Metrics:   dev.metrics(w, h, s.meta.Mode == modeHeadless),
 		Script:    dev.initScript(ver),
@@ -676,7 +768,7 @@ func (s *session) launch(ctx context.Context) error {
 		return fmt.Errorf("device emulation: %w", err)
 	}
 
-	allocCtx, allocStop := chromedp.NewRemoteAllocator(context.Background(), proc.WSURL, chromedp.NoModifyURL)
+	allocCtx, allocStop := chromedp.NewRemoteAllocator(context.Background(), proc.wsURL(), chromedp.NoModifyURL)
 	opts := []chromedp.ContextOption{chromedp.WithErrorf(func(f string, a ...any) { logf("chromedp: "+f, a...) })}
 	if cfg.Verbose {
 		opts = append(opts, chromedp.WithLogf(func(f string, a ...any) { logf("chromedp: "+f, a...) }))
@@ -704,7 +796,7 @@ func (s *session) launch(ctx context.Context) error {
 		c := chromedp.FromContext(browserCtx)
 		bctx := cdp.WithExecutor(cctx, c.Browser)
 		if err := browser.SetDownloadBehavior(browser.SetDownloadBehaviorBehaviorAllow).
-			WithDownloadPath(s.downloadsDir()).WithEventsEnabled(true).Do(bctx); err != nil {
+			WithDownloadPath(s.chrome.downloadsDir()).WithEventsEnabled(true).Do(bctx); err != nil {
 			logf("session %s: download behaviour: %v", s.meta.ID, err)
 		}
 		// Chrome opens its first tab; it can take a moment to appear as

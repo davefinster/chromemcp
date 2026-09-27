@@ -8,6 +8,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +25,30 @@ import (
 
 	"github.com/coder/websocket"
 )
+
+// hostOS is the operating system this process runs on, as Go names it
+// ("linux", "darwin"). A variable so the flag tests can pretend.
+var hostOS = goruntime.GOOS
+
+func goArch() string { return goruntime.GOARCH }
+
+// chromeHandle is a session's running Chrome, wherever it runs: a child of
+// this process (chromeProc), or one a node runs for it (remoteChrome,
+// remote.go). Everything that drives it goes through the DevTools
+// websocket, so this is all a session needs to know about where it is.
+type chromeHandle interface {
+	Alive() bool
+	// stop closes Chrome, gracefully if it will; grace bounds the wait.
+	stop(grace time.Duration)
+	// wsURL is the browser's DevTools websocket, reachable from here.
+	wsURL() string
+	// debugPort is the loopback port serving that endpoint's HTTP side
+	// (/json/version), which chrome-devtools-mcp is pointed at.
+	debugPort() int
+	// downloadsDir is where Chrome saves downloads, as a path on the
+	// machine Chrome runs on.
+	downloadsDir() string
+}
 
 type chromeLaunch struct {
 	Exe         string
@@ -33,17 +59,25 @@ type chromeLaunch struct {
 	Width       int    // window size; the page viewport in headless mode
 	Height      int
 	NoSandbox   bool
-	ExtraFlags  []string
-	Env         []string // extra environment, "K=V"
-	Verbose     bool
-	Logf        func(string, ...any)
+	// Port is the remote-debugging port; 0 lets Chrome pick one. A node
+	// fixes it, because its firewall admits only a known range.
+	Port int
+	// DisableFeatures are Chrome features to turn off on top of the ones
+	// every launch turns off: Chrome honours only the last
+	// --disable-features on its command line, so they go into one flag.
+	DisableFeatures []string
+	ExtraFlags      []string
+	Env             []string // extra environment, "K=V"
+	Verbose         bool
+	Logf            func(string, ...any)
 }
 
-// chromeProc is a running Chrome.
+// chromeProc is a running Chrome, this process's child.
 type chromeProc struct {
-	cmd   *exec.Cmd
-	Port  int    // remote-debugging port
-	WSURL string // ws://127.0.0.1:port/devtools/browser/<id>
+	cmd       *exec.Cmd
+	Port      int    // remote-debugging port
+	WSURL     string // ws://127.0.0.1:port/devtools/browser/<id>
+	Downloads string
 
 	done    chan struct{}
 	exitErr error
@@ -56,7 +90,7 @@ type chromeProc struct {
 func (l *chromeLaunch) flags() []string {
 	args := []string{
 		"--user-data-dir=" + l.UserDataDir,
-		"--remote-debugging-port=0",
+		fmt.Sprintf("--remote-debugging-port=%d", l.Port),
 		// A fresh install's first-run prompts and the "make Chrome your
 		// default browser" nag would otherwise sit over the page.
 		"--no-first-run",
@@ -69,15 +103,28 @@ func (l *chromeLaunch) flags() []string {
 		// offer to restore pages, it must just restore its state quietly.
 		"--hide-crash-restore-bubble",
 		"--disable-session-crashed-bubble",
-		"--disable-features=Translate,MediaRouter",
+		"--disable-features=" + strings.Join(append([]string{"Translate", "MediaRouter"}, l.DisableFeatures...), ","),
 		"--disable-background-networking",
 		"--disable-component-update",
 		"--disable-dev-shm-usage",
 		"--window-position=0,0",
 		fmt.Sprintf("--window-size=%d,%d", l.Width, l.Height),
 	}
+	if hostOS == "darwin" {
+		// Chrome on macOS keeps its cookie key in the login keychain, and
+		// asks for it with a dialog that nobody is there to answer. The mock
+		// keychain is a fixed key, which also keeps a node's Chrome out of
+		// the account's real keychain altogether.
+		args = append(args, "--use-mock-keychain")
+	}
 	if l.Headless {
-		args = append(args, "--headless=new", "--disable-gpu")
+		args = append(args, "--headless=new")
+		// A container has no GPU, and headless Chrome renders in software
+		// there anyway. A Mac has one, and headless Chrome uses it (Metal,
+		// through ANGLE) -- the real GPU is most of the point of a Mac node.
+		if hostOS != "darwin" {
+			args = append(args, "--disable-gpu")
+		}
 	} else {
 		// Without a GPU, headful Chrome has no WebGL at all unless it is
 		// allowed to fall back to SwiftShader — which headless does by
@@ -108,7 +155,12 @@ func launchChrome(ctx context.Context, l *chromeLaunch) (*chromeProc, error) {
 	os.Remove(filepath.Join(l.UserDataDir, "DevToolsActivePort"))
 
 	cmd := exec.Command(l.Exe, l.flags()...)
-	cmd.Env = append(os.Environ(), "HOME="+l.UserDataDir)
+	cmd.Env = os.Environ()
+	if hostOS != "darwin" {
+		// Keeps what Chrome writes under $HOME inside the profile. Chrome
+		// on macOS finds its folders from the account instead, not $HOME.
+		cmd.Env = append(cmd.Env, "HOME="+l.UserDataDir)
+	}
 	cmd.Env = append(cmd.Env, l.Env...)
 	if l.Headless {
 		cmd.Env = append(cmd.Env, "DISPLAY=")
@@ -133,7 +185,7 @@ func launchChrome(ctx context.Context, l *chromeLaunch) (*chromeProc, error) {
 		return nil, fmt.Errorf("starting chrome: %w", err)
 	}
 	pw.Close()
-	p := &chromeProc{cmd: cmd, done: make(chan struct{})}
+	p := &chromeProc{cmd: cmd, Downloads: l.Downloads, done: make(chan struct{})}
 	go p.readStderr(pr, l)
 	go func() {
 		p.exitErr = cmd.Wait()
@@ -155,7 +207,14 @@ func launchChrome(ctx context.Context, l *chromeLaunch) (*chromeProc, error) {
 			return nil, ctx.Err()
 		default:
 		}
-		if b, err := os.ReadFile(portFile); err == nil {
+		if l.Port != 0 {
+			// A fixed port: Chrome does not always write DevToolsActivePort
+			// then (macOS, measured), so ask the port itself.
+			if ws := devtoolsBrowserURL(l.Port); ws != "" {
+				p.Port, p.WSURL = l.Port, ws
+				return p, nil
+			}
+		} else if b, err := os.ReadFile(portFile); err == nil {
 			lines := strings.Split(strings.TrimSpace(string(b)), "\n")
 			if len(lines) >= 2 {
 				port, err := strconv.Atoi(strings.TrimSpace(lines[0]))
@@ -172,6 +231,24 @@ func launchChrome(ctx context.Context, l *chromeLaunch) (*chromeProc, error) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// devtoolsBrowserURL is the browser websocket a DevTools port advertises,
+// or "" while it is not answering.
+func devtoolsBrowserURL(port int) string {
+	c := &http.Client{Timeout: 2 * time.Second}
+	resp, err := c.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var v struct {
+		WS string `json:"webSocketDebuggerUrl"`
+	}
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&v) != nil {
+		return ""
+	}
+	return v.WS
 }
 
 func devtoolsUp(port int) bool {
@@ -207,6 +284,10 @@ func (p *chromeProc) lastStderr() string {
 	defer p.mu.Unlock()
 	return strings.Join(p.stderr, "\n")
 }
+
+func (p *chromeProc) wsURL() string        { return p.WSURL }
+func (p *chromeProc) debugPort() int       { return p.Port }
+func (p *chromeProc) downloadsDir() string { return p.Downloads }
 
 // Alive reports whether the process is still running.
 func (p *chromeProc) Alive() bool {

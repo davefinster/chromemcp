@@ -370,7 +370,7 @@ func TestToolRegistry(t *testing.T) {
 			enum []string
 			def  string
 		}{
-			"device": {deviceNames(), "windows"},
+			"device": {mgr.deviceNames(), "windows"},
 			"mode":   {[]string{"headless", "headful"}, "headless"},
 		} {
 			got := schema.Properties[prop]

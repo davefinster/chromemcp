@@ -9,7 +9,7 @@ works), and can pass each session through to Google's
 [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp)
 for the low-level work it does not reimplement.
 
-One Go binary, four parts:
+One Go binary, five parts:
 
 | part | what |
 |---|---|
@@ -17,6 +17,7 @@ One Go binary, four parts:
 | sessions | One Chrome per session on its own profile directory, like the first launch on a clean workstation, with whatever files the agent has put on it for a page's file picker. Ephemeral: parked when idle (Chrome closed, profile kept, resumable), deleted when old. |
 | identities | Named snapshots of a profile the owner has logged into — the persistent part. A session started *as* an identity begins already signed in. |
 | live view | Headful sessions render on an Xvnc display; a token link serves noVNC over the server's own websocket bridge, so a person can watch, take over, and sign in where no agent can (passkeys, 2FA). |
+| nodes | `chromemcp node` on another machine — a Mac — runs sessions' Chrome for the server over mutual TLS, so `device=mac` is a real Mac's Chrome with its own GPU and fonts ([Nodes](#nodes)). |
 
 ## Tools
 
@@ -377,6 +378,8 @@ matter:
 | `-idle-park`, `-max-age`, `-max-running` | `CHROMEMCP_IDLE_PARK`, … | 30m, 24h, 6 |
 | `-view-ttl`, `-view-url` | `CHROMEMCP_VIEW_TTL`, `CHROMEMCP_VIEW_URL` | 30m; `-public-url` |
 | `-upload-ttl` | `CHROMEMCP_UPLOAD_TTL` | 1h (upload links; they share `-view-url`) |
+| `-node NAME=URL` | `CHROMEMCP_NODES` (space-separated) | none; repeatable ([Nodes](#nodes)) |
+| `-node-cert`, `-node-key`, `-node-ca` | `CHROMEMCP_NODE_CERT`, `…_KEY`, `…_CA` | the client certificate presented to nodes, and the CA theirs chain to |
 
 `GET /healthz` is unauthenticated and reports the version, the session
 counts, and whether headful sessions and the passthrough are available.
@@ -438,6 +441,104 @@ the identities (the one thing worth keeping), an emptyDir for `/tmp`, and a
 memory request that allows for `-max-running` Chromes at a few hundred MB
 each. The proxy must pass websockets for `/view/`.
 
+## Nodes
+
+A server in a container runs Chrome on SwiftShader and stand-in fonts, and
+the `windows` profile can only describe a GPU it does not have. A **node**
+is another machine that runs sessions' Chrome for the server — built for a
+Mac, where Chrome is simply a Mac's: its real GPU (Metal, through ANGLE,
+headless included), its own fonts and hardware numbers. `session_start
+device=mac` places the session on a node whose OS is macOS; nothing else
+about the session changes.
+
+```
+server ── mutual TLS ──▶ tailscale serve --tcp 9310 ──▶ chromemcp node (127.0.0.1:9310, as a dedicated user)
+  │  relay 127.0.0.1:N ◀── chromedp, emulator, cookies,          │  Chrome --headless=new, DevTools on 9300–9309
+  │                         chrome-devtools-mcp                   └─ sessions/s-…/{profile,downloads,files}
+  └─ sessions/s-…/{session.json, cookies.json, files/}
+```
+
+- **The server keeps the session; the node runs the Chrome.** Metadata, the
+  cookie jar, put files, the device profile, parking and the reaper stay on
+  the server. The node launches and stops Chrome for a session id, relays its
+  DevTools endpoint, and holds the profile and whatever Chrome downloads.
+- **The DevTools endpoint comes back to loopback.** Each running remote
+  session gets a relay on `127.0.0.1` that forwards everything, websockets
+  included, to the node, and sends its own address as the `Host` — Chrome
+  builds the URLs it advertises from that header — so chromedp, the device
+  emulator and chrome-devtools-mcp connect exactly as they do to a local
+  Chrome. A put file is copied to the node when a page is about to be given
+  it (`DOM.setFileInputFiles` takes a path on Chrome's machine); downloads
+  are listed and deleted through the node. A watcher long-polls the node, so
+  a Chrome that dies there is noticed here and relaunched on next use.
+- **Mutual TLS only.** Both ends present a certificate from the same CA;
+  the node admits only the client names given with `-allow-client`, since
+  everything that CA signed would otherwise do. Certificates are read again
+  whenever their files change, so a short-lived one renewed in place (step-ca
+  and the like) needs no restart. The node binds loopback by default; the
+  intended way in is `tailscale serve --tcp`, which forwards raw TCP and so
+  keeps the TLS end to end.
+- **What a server may ask for is bounded.** The node builds Chrome's command
+  line itself and accepts only the user agent, Blink settings and language
+  flags, and only `TZ`/`LANG`/`LANGUAGE` in the environment — nothing that
+  runs a command as its account (`--renderer-cmd-prefix`), moves the profile,
+  opens the DevTools port wider or changes how Chrome is loaded (`DYLD_*`).
+- **On macOS** it launches Chrome with `--use-mock-keychain` (never the
+  account's keychain, and no dialog nobody can answer), keeps the GPU on in
+  headless mode, turns off Chrome's own DNS client by default (`-disable-features
+  AsyncDns`, so names resolve through mDNSResponder rather than by this
+  account's packets to the LAN resolver), and sets the session's language
+  through Chrome's `AppleLanguages` preference just before each launch —
+  Chrome on macOS ignores `--lang` and the environment for it. `TZ` works as
+  on Linux.
+- **Not yet:** identities (`identity_save`, `session_start identity=`) and
+  headful sessions on a node; both are refused with a message saying so.
+
+Run it as a dedicated standard account that owns nothing else, from launchd —
+not from an SSH session, which on macOS can hand its processes the Full Disk
+Access that Remote Login holds:
+
+```xml
+<!-- /Library/LaunchDaemons/com.example.chromemcp-node.plist -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.example.chromemcp-node</string>
+  <key>UserName</key><string>chromenode</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/local/bin/chromemcp</string><string>node</string>
+    <string>-tls-cert</string><string>/usr/local/etc/chromemcp-node/node.crt</string>
+    <string>-tls-key</string><string>/usr/local/etc/chromemcp-node/node.key</string>
+    <string>-client-ca</string><string>/usr/local/etc/chromemcp-node/ca.crt</string>
+    <string>-allow-client</string><string>chromemcp.example.com</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>/Users/chromenode/Library/Logs/chromemcp-node.log</string>
+</dict></plist>
+```
+
+and firewall that account to the public internet: a browser loads arbitrary
+pages, and on the same machine as other services a page is local code. With
+pf, `user` rules drop its TCP and UDP to loopback, the private, link-local,
+CGNAT (tailnet) and multicast ranges, and the LAN by interface
+(`(en0:network)`: a LAN's IPv6 prefix is usually a global one). Two things
+to get right: a `pass out` for loopback 9300–9309 so it can reach its own
+Chrome, and a `pass in … keep state` for loopback 9300–9310, because `user`
+matches the *sending* socket and the replies from its own listeners would
+otherwise meet the block. `chromemcp node -h` lists the rest: `-ports`,
+`-max-running` (default 1), `-sessions-dir` (`~/Library/Caches/chromemcp-node`).
+
+Then on the server:
+
+```bash
+chromemcp serve ... -node mac=https://mac.example.ts.net:9310 \
+  -node-cert client.crt -node-key client.key -node-ca ca.crt
+```
+
+`mac` is offered in `session_start`'s device list whenever a node is
+configured, and placed on the first node that reports macOS; a node's own
+`-max-running` is its limit, and the server parks the least recently used of
+that node's sessions to make room.
+
 ## Tests
 
 `go test ./...` runs the OAuth stack against a fake authorization server,
@@ -462,7 +563,15 @@ clicked — checked by what the page's own `change` handler reports, the
 second of the two over the MCP wire from `file_put` to `file_delete`; and
 `TestDropPageInChrome`, which opens the upload link's own page in a session
 and chooses a file through it, because that page's JavaScript only ever runs
-in a browser. They
+in a browser; and `TestNodeSessionIntegration`, a node in the test process
+over mutual TLS on loopback with this machine's Chrome, driven through the
+manager: placement, the device profile through the relay, a put file copied
+over and given to a page, a download listed and deleted through the node,
+park and resume with the cookie carried back, a Chrome killed on the node
+noticed and relaunched, and deletion reaching the node. `TestNodeMutualTLS`
+and `TestCertReload` need no Chrome: an unlisted certificate, one from
+another CA and none at all are refused, the launch request is bounded, and a
+renewed certificate is served without a restart. They
 skip themselves where there is no Chrome, as in the image's build stage;
 `CHROMEMCP_TEST_NO_CHROME=1` skips them anywhere.
 
