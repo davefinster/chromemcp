@@ -291,14 +291,9 @@ func (m *manager) start(ctx context.Context, o startOptions) (*session, error) {
 	if err != nil {
 		return nil, err
 	}
-	if node != nil {
-		if o.Mode == modeHeadful {
-			return nil, fmt.Errorf("device %s runs on node %s, headless only: a node has no display to give a live view of", dev.Name, node.name)
-		}
-		if o.Identity != "" {
-			return nil, fmt.Errorf("device %s runs on node %s, where identities are not supported yet", dev.Name, node.name)
-		}
-	} else if o.Mode == modeHeadful && m.cfg.Xvnc == "" {
+	// A node decides for itself whether it can run a headful Chrome (a Mac
+	// can, with no display of its own; node.go's launch).
+	if node == nil && o.Mode == modeHeadful && m.cfg.Xvnc == "" {
 		return nil, errors.New("headful sessions are unavailable on this server (no Xvnc); use mode \"headless\"")
 	}
 	if o.Timezone != "" {
@@ -329,6 +324,17 @@ func (m *manager) start(ctx context.Context, o startOptions) (*session, error) {
 		if err := m.identities.seed(o.Identity, s.dir); err != nil {
 			os.RemoveAll(dir)
 			return nil, fmt.Errorf("seeding profile from identity %q: %w", o.Identity, err)
+		}
+		// On a node the profile is Chrome's there: send it, and keep only
+		// the cookie jar here, which is the server's to import at launch.
+		if node != nil {
+			err := node.pushProfile(ctx, id, s.profileDir())
+			os.RemoveAll(s.profileDir())
+			if err != nil {
+				node.remove(context.Background(), id)
+				os.RemoveAll(dir)
+				return nil, fmt.Errorf("sending identity %q to node %s: %w", o.Identity, node.name, err)
+			}
 		}
 	}
 	if err := s.saveMeta(); err != nil {
@@ -681,7 +687,7 @@ func (s *session) launch(ctx context.Context) error {
 		}
 	}
 	var disp *display
-	if s.meta.Mode == modeHeadful {
+	if s.meta.Mode == modeHeadful && node == nil { // a node's headful window is the node's own
 		var err error
 		disp, err = startDisplay(ctx, cfg.Xvnc, s.meta.ID, w, h+headfulChromeHeight, cfg.Verbose)
 		if err != nil {
@@ -729,13 +735,17 @@ func (s *session) launch(ctx context.Context) error {
 	if disp != nil {
 		l.Display = disp.Display()
 		l.Height = h + headfulChromeHeight
+	} else if node != nil && s.meta.Mode == modeHeadful {
+		// A node's headful window: the viewport plus the toolbar, as on an
+		// Xvnc display here (a Mac's window has no side frame).
+		l.Height = h + headfulChromeHeight
 	} else if dev.emulated() {
 		l.Width, l.Height = w+windowFrameWidth, h+headfulChromeHeight
 	}
 	var proc chromeHandle
 	if node != nil {
 		rc, err := node.launch(ctx, s.meta.ID, &nodeLaunchRequest{
-			Headless: true, Width: l.Width, Height: l.Height,
+			Headless: s.meta.Mode == modeHeadless, Width: l.Width, Height: l.Height,
 			Flags: l.ExtraFlags, Env: l.Env, Prefs: dev.fontPrefs(), Locale: s.meta.Locale,
 		})
 		if err != nil {

@@ -27,7 +27,14 @@ type identityMeta struct {
 	Created time.Time `json:"created"`
 	Updated time.Time `json:"updated"`
 	Session string    `json:"session,omitempty"` // the session it was last saved from
-	Bytes   int64     `json:"bytes"`
+	// Device is the device profile that session presented (device.go): the
+	// machine the identity's sites last saw it on. A session on another
+	// device starts with its cookies and site storage all the same (the
+	// jar travels as cookies.json, storage as plain files), but not its
+	// saved passwords, which are encrypted per machine -- and a site may
+	// treat it as a sign-in from a new device.
+	Device string `json:"device,omitempty"`
+	Bytes  int64  `json:"bytes"`
 }
 
 type identityStore struct {
@@ -111,7 +118,7 @@ func (st *identityStore) seed(name, sessionDir string) error {
 // save snapshots a session directory — the profile (Chrome must not be
 // running on it) and the cookie jar exported when it was parked — as an
 // identity, replacing an existing one only with overwrite.
-func (st *identityStore) save(name, note, session, sessionDir string, overwrite bool) (*identityMeta, error) {
+func (st *identityStore) save(name, note, session, device, sessionDir string, overwrite bool) (*identityMeta, error) {
 	if err := checkIdentityName(name); err != nil {
 		return nil, err
 	}
@@ -137,7 +144,7 @@ func (st *identityStore) save(name, note, session, sessionDir string, overwrite 
 		n += cn
 	}
 	now := time.Now()
-	m := &identityMeta{Name: name, Note: note, Created: now, Updated: now, Session: session, Bytes: n}
+	m := &identityMeta{Name: name, Note: note, Created: now, Updated: now, Session: session, Device: device, Bytes: n}
 	if existing != nil {
 		m.Created = existing.Created
 		if note == "" {

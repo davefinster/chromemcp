@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // testCA is a throwaway certificate authority for the mutual-TLS tests.
@@ -345,7 +347,7 @@ func TestNodeSessionIntegration(t *testing.T) {
 	defer cancel()
 
 	// Refused before anything launches: what a node cannot do.
-	if _, err := mgr.start(ctx, startOptions{Device: "testnode", Mode: modeHeadful}); err == nil || !strings.Contains(err.Error(), "headless only") {
+	if _, err := mgr.start(ctx, startOptions{Device: "testnode", Mode: modeHeadful}); err == nil || !strings.Contains(err.Error(), "headless sessions only") {
 		t.Errorf("headful on a node: %v", err)
 	}
 
@@ -456,6 +458,65 @@ func TestNodeSessionIntegration(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	// An identity saved from a node session: its profile comes back from the
+	// node, its cookie jar is the server's; and a new node session started
+	// from it gets both -- the cookie, and the site storage in the profile.
+	err = mgr.withTab(ctx, sid, "", func(ctx context.Context, s *session, tb *tab) error {
+		var ok bool
+		return evalJSON(ctx, tb, "(localStorage.setItem('ls', 'kept'), true)", &ok)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &mcpApp{mgr: mgr}
+	if res, _, err := app.identitySave(ctx, nil, identitySaveIn{SessionID: sid, Name: "on-node"}); err != nil {
+		t.Fatalf("identity_save on a node session: %v", err)
+	} else if txt := res.Content[0].(*mcp.TextContent).Text; strings.Contains(txt, "did not restart") {
+		t.Errorf("identity_save: %s", txt)
+	}
+	im, err := mgr.identities.get("on-node")
+	if err != nil || im.Device != "testnode" || im.Bytes == 0 {
+		t.Fatalf("saved identity: %+v %v", im, err)
+	}
+	if _, err := os.Stat(s.profileDir()); err == nil {
+		t.Error("the profile fetched for the save was left on the server")
+	}
+	s2, err := mgr.start(ctx, startOptions{Device: "testnode", Identity: "on-node"})
+	if err != nil {
+		t.Fatalf("starting a node session from an identity: %v", err)
+	}
+	if _, err := os.Stat(s2.profileDir()); err == nil {
+		t.Error("the identity's profile stayed on the server instead of going to the node")
+	}
+	if _, err := os.Stat(filepath.Join(nodeDir, s2.meta.ID, "profile", "Default")); err != nil {
+		t.Errorf("no profile on the node for the identity's session: %v", err)
+	}
+	err = mgr.withTab(ctx, s2.meta.ID, "", func(ctx context.Context, s *session, tb *tab) error {
+		if err := navigate(ctx, tb, srv.URL, 20*time.Second); err != nil {
+			return err
+		}
+		var got struct {
+			Cookie string `json:"cookie"`
+			LS     string `json:"ls"`
+		}
+		if err := evalJSON(ctx, tb, "({cookie: document.cookie, ls: localStorage.getItem('ls')})", &got); err != nil {
+			return err
+		}
+		if !strings.Contains(got.Cookie, "nc=1") || got.LS != "kept" {
+			t.Errorf("a session from the identity has cookie %q, localStorage %q", got.Cookie, got.LS)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.remove(s2.meta.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.running(ctx, sid); err != nil {
+		t.Fatalf("resuming the first session: %v", err)
 	}
 
 	// A Chrome that dies on the node is noticed here.

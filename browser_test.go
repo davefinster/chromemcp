@@ -245,7 +245,7 @@ func TestBrowserIntegration(t *testing.T) {
 	// Identity: save from the running session, start another from it.
 	s.mu.Lock()
 	s.park()
-	m, err := mgr.identities.save("tester", "", sid, s.dir, false)
+	m, err := mgr.identities.save("tester", "", sid, "", s.dir, false)
 	relaunch := s.launch(ctx)
 	s.mu.Unlock()
 	if err != nil || relaunch != nil {

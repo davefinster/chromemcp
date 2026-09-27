@@ -220,7 +220,7 @@ func TestSessionFilesFollowTheSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := mgr.identities.save("someone", "", s.meta.ID, s.dir, false); err != nil {
+	if _, err := mgr.identities.save("someone", "", s.meta.ID, "", s.dir, false); err != nil {
 		t.Fatal(err)
 	}
 	other := &session{mgr: mgr, dir: filepath.Join(mgr.cfg.SessionsDir, "s-33334444"), meta: sessionMeta{ID: "s-33334444"}}

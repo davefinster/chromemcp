@@ -125,11 +125,11 @@ func (l *chromeLaunch) flags() []string {
 		if hostOS != "darwin" {
 			args = append(args, "--disable-gpu")
 		}
-	} else {
+	} else if hostOS != "darwin" {
 		// Without a GPU, headful Chrome has no WebGL at all unless it is
 		// allowed to fall back to SwiftShader — which headless does by
 		// itself. A browser with no WebGL breaks maps and charts, and is
-		// nothing like the PC a device profile describes.
+		// nothing like the PC a device profile describes. (A Mac has a GPU.)
 		args = append(args, "--enable-unsafe-swiftshader")
 	}
 	if l.NoSandbox {

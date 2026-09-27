@@ -222,6 +222,42 @@ func (n *nodeClient) deleteFile(ctx context.Context, id, name string) error {
 	return n.do(ctx, http.MethodDelete, sessionPath(id)+"/files/"+url.PathEscape(name), nil, nil)
 }
 
+// pushProfile replaces the session's profile on the node with the one at
+// src: an identity the session is to start from.
+func (n *nodeClient) pushProfile(ctx context.Context, id, src string) error {
+	pr, pw := io.Pipe()
+	go func() { pw.CloseWithError(writeProfileArchive(pw, src)) }()
+	defer pr.Close()
+	return n.do(ctx, http.MethodPut, sessionPath(id)+"/profile", pr, nil)
+}
+
+// pullProfile fetches the session's profile from the node into dst, which
+// must not exist yet. The session must be parked.
+func (n *nodeClient) pullProfile(ctx context.Context, id, dst string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, n.url(sessionPath(id)+"/profile"), nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := (&http.Client{Transport: n.transport}).Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("node %s: %w", n.name, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var e struct {
+			Error string `json:"error"`
+		}
+		json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&e)
+		return 0, fmt.Errorf("node %s: fetching the profile: %s %s", n.name, resp.Status, e.Error)
+	}
+	nb, err := readProfileArchive(resp.Body, dst)
+	if err != nil {
+		os.RemoveAll(dst)
+		return 0, fmt.Errorf("node %s: %w", n.name, err)
+	}
+	return nb, nil
+}
+
 // putFile copies a file to the node and returns its path there.
 func (n *nodeClient) putFile(ctx context.Context, id, name string, body io.Reader) (string, error) {
 	var out struct {

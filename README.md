@@ -16,7 +16,7 @@ One Go binary, five parts:
 | MCP server | Streamable HTTP (or stdio), OAuth-protected: AuthKit issuer, resource identifier, single-account email pin. 34 tools. |
 | sessions | One Chrome per session on its own profile directory, like the first launch on a clean workstation, with whatever files the agent has put on it for a page's file picker. Ephemeral: parked when idle (Chrome closed, profile kept, resumable), deleted when old. |
 | identities | Named snapshots of a profile the owner has logged into — the persistent part. A session started *as* an identity begins already signed in. |
-| live view | Headful sessions render on an Xvnc display; a token link serves noVNC over the server's own websocket bridge, so a person can watch, take over, and sign in where no agent can (passkeys, 2FA). |
+| live view | Headful sessions render on an Xvnc display; a token link serves noVNC over the server's own websocket bridge, so a person can watch, take over, and sign in where no agent can (passkeys, 2FA). A session with no display — a node's, or a headless one — gets a screencast view instead: frames from DevTools, mouse and keys sent back. |
 | nodes | `chromemcp node` on another machine — a Mac — runs sessions' Chrome for the server over mutual TLS, so `device=mac` is a real Mac's Chrome with its own GPU and fonts ([Nodes](#nodes)). |
 
 ## Tools
@@ -29,7 +29,7 @@ One Go binary, five parts:
 | `session_list` | running and parked sessions (what can be resumed), plus the saved identities |
 | `session_resume` / `session_stop` | relaunch a parked session with its cookies, storage and tabs; park a running one |
 | `session_delete` | close and erase a session |
-| `session_view` | a live-view link for a headful session, for a person to open |
+| `session_view` | a live-view link for a person to open: noVNC for a headful session here, a screencast for any other |
 
 **Identities**
 
@@ -510,8 +510,28 @@ server ── mutual TLS ──▶ tailscale serve --tcp 9310 ──▶ chromemc
   through Chrome's `AppleLanguages` preference just before each launch —
   Chrome on macOS ignores `--lang` and the environment for it. `TZ` works as
   on Linux.
-- **Not yet:** identities (`identity_save`, `session_start identity=`) and
-  headful sessions on a node; both are refused with a message saying so.
+- **Headful on a Mac is a real window nobody sees.** The node's account has
+  no login session, yet a non-headless Chrome launched by it renders all the
+  same — the Metal GPU, screenshots, a user agent with no `HeadlessChrome` in
+  it natively — in a window WindowServer never shows. The node turns off the
+  throttling Chrome applies to occluded windows, which that window would
+  otherwise count as. A Linux node has no display and stays headless-only.
+- **The live view of a node session is a screencast** (`castview.go`), since
+  there is no framebuffer for VNC: `Page.startScreencast` frames to a small
+  page under the same token as the noVNC view (`/view/<tok>/cast`), and the
+  viewer's mouse, wheel, keys and paste go back as `Input.dispatch*`. It
+  follows tabs as they open (a sign-in popup), lists them to switch between,
+  and brings the one it shows to the front. It cannot reach what the page
+  never sees: a native dialog, a passkey on the machine's own authenticator.
+  Any session without a display gets one, headless sessions here included.
+- **Identities cross over as profile archives.** `session_start identity=`
+  on a node sends the identity's profile there (a gzipped tar, minus the
+  caches `copyProfile` skips; unpacked only as plain files beneath the
+  profile); `identity_save` parks the session, fetches the profile back and
+  saves it with the cookie jar the server already holds. An identity records
+  the device it was saved from, and a session on another device is told
+  what does not come across: the saved passwords, encrypted per machine,
+  and the site's sense of which device it has seen before.
 
 Run it as a dedicated standard account that owns nothing else, from launchd —
 not from an SSH session, which on macOS can hand its processes the Full Disk

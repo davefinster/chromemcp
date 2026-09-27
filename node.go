@@ -28,6 +28,8 @@ package main
 //	GET    /sessions/{id}/wait                 block until it exits (or a timeout)
 //	DELETE /sessions/{id}                      close it and delete everything
 //	*      /sessions/{id}/cdp/...              its DevTools endpoint, HTTP and websocket
+//	GET    /sessions/{id}/profile              the profile, as an archive (Chrome stopped)
+//	PUT    /sessions/{id}/profile              replace it: an identity to start from
 //	GET    /sessions/{id}/downloads            what Chrome downloaded
 //	DELETE /sessions/{id}/downloads/{name}
 //	PUT    /sessions/{id}/files/{name}         a file for a page's file picker
@@ -344,6 +346,8 @@ func (ns *nodeServer) handler() http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{id}/wait", ns.withID(ns.wait))
 	mux.HandleFunc("DELETE /v1/sessions/{id}", ns.withID(ns.remove))
 	mux.HandleFunc("/v1/sessions/{id}/cdp/", ns.withID(ns.cdp))
+	mux.HandleFunc("GET /v1/sessions/{id}/profile", ns.withID(ns.getProfile))
+	mux.HandleFunc("PUT /v1/sessions/{id}/profile", ns.withID(ns.putProfile))
 	mux.HandleFunc("GET /v1/sessions/{id}/downloads", ns.withID(ns.downloads))
 	mux.HandleFunc("DELETE /v1/sessions/{id}/downloads/{name}", ns.withID(ns.deleteDownload))
 	mux.HandleFunc("PUT /v1/sessions/{id}/files/{name}", ns.withID(ns.putFile))
@@ -442,7 +446,7 @@ func (ns *nodeServer) launch(w http.ResponseWriter, r *http.Request, id string) 
 		nodeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if !req.Headless {
+	if !req.Headless && hostOS != "darwin" {
 		nodeError(w, http.StatusBadRequest, errors.New("this node runs headless sessions only: it has no display of its own to give one"))
 		return
 	}
@@ -500,16 +504,26 @@ func (ns *nodeServer) launch(w http.ResponseWriter, r *http.Request, id string) 
 	if err := mergeProfilePrefs(profile, req.Prefs); err != nil {
 		logf("node: session %s: preferences: %v", id, err)
 	}
+	extra := req.Flags
+	if !req.Headless {
+		// A headful Chrome on a Mac, run by an account with no login session:
+		// a real browser window that WindowServer never shows. Chrome renders
+		// it all the same (measured: screenshots, the Metal GPU), but it would
+		// take an unseen window for an occluded one and stop producing frames
+		// and firing timers, which a live view and a page's own scripts need.
+		extra = append(append([]string(nil), extra...),
+			"--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", "--disable-background-timer-throttling")
+	}
 	l := &chromeLaunch{
 		Exe:             ns.cfg.Chrome,
 		UserDataDir:     profile,
 		Downloads:       filepath.Join(dir, "downloads"),
-		Headless:        true,
+		Headless:        req.Headless,
 		Width:           req.Width,
 		Height:          req.Height,
 		Port:            port,
 		DisableFeatures: ns.cfg.DisableFeatures,
-		ExtraFlags:      req.Flags,
+		ExtraFlags:      extra,
 		Env:             req.Env,
 		Verbose:         ns.cfg.Verbose,
 		Logf:            logf,
@@ -653,6 +667,58 @@ func (ns *nodeServer) cdp(w http.ResponseWriter, r *http.Request, id string) {
 		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+// getProfile streams the session's profile, for the server to save as an
+// identity. Only with Chrome stopped: its databases are consistent on disk
+// only after a clean exit, which is why the server parks the session first.
+func (ns *nodeServer) getProfile(w http.ResponseWriter, r *http.Request, id string) {
+	if ns.running(id) != nil {
+		nodeError(w, http.StatusConflict, fmt.Errorf("session %s is running; stop it first", id))
+		return
+	}
+	profile := filepath.Join(ns.sessionDir(id), "profile")
+	if _, err := os.Stat(profile); err != nil {
+		nodeError(w, http.StatusNotFound, fmt.Errorf("session %s has no profile here", id))
+		return
+	}
+	w.Header().Set("Content-Type", "application/gzip")
+	if err := writeProfileArchive(w, profile); err != nil {
+		// Headers are gone; the truncated body fails the reader's gzip check.
+		logf("node: session %s: sending its profile: %v", id, err)
+	}
+}
+
+// putProfile replaces the session's profile with the archive sent: an
+// identity a session is to start from. Unpacked beside and swapped in, so
+// a failed transfer leaves the old profile (or none) rather than half of one.
+func (ns *nodeServer) putProfile(w http.ResponseWriter, r *http.Request, id string) {
+	if ns.running(id) != nil {
+		nodeError(w, http.StatusConflict, fmt.Errorf("session %s is running; stop it first", id))
+		return
+	}
+	dir := ns.sessionDir(id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		nodeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	incoming := filepath.Join(dir, ".profile-incoming")
+	os.RemoveAll(incoming)
+	n, err := readProfileArchive(r.Body, incoming)
+	if err != nil {
+		os.RemoveAll(incoming)
+		nodeError(w, http.StatusBadRequest, err)
+		return
+	}
+	profile := filepath.Join(dir, "profile")
+	os.RemoveAll(profile)
+	if err := os.Rename(incoming, profile); err != nil {
+		os.RemoveAll(incoming)
+		nodeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	logf("node: session %s: profile replaced (%d bytes)", id, n)
+	nodeJSON(w, map[string]int64{"bytes": n})
 }
 
 func (ns *nodeServer) downloads(w http.ResponseWriter, r *http.Request, id string) {

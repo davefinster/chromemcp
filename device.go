@@ -100,7 +100,7 @@ const (
 var deviceProfiles = map[string]*deviceProfile{
 	"mac": {
 		Name:        "mac",
-		Description: "a real Mac with Apple silicon running Chrome on macOS, on a node: its own GPU, fonts and hardware, a 1920x1080 display at 100%; headless, no identities yet",
+		Description: "a real Mac with Apple silicon running Chrome on macOS, on a node: its own GPU, fonts and hardware, a 1920x1080 display at 100%",
 		OS:          "darwin",
 		// Chrome's frozen macOS UA: "Intel Mac OS X 10_15_7" on every Mac,
 		// Apple silicon included. The headless build says HeadlessChrome.

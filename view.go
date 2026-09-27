@@ -109,8 +109,15 @@ func (h *viewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "this view link has expired; ask for a new one (session_view)", http.StatusForbidden)
 		return
 	}
-	if path == "ws" {
+	switch path {
+	case "ws":
 		h.bridge(w, r, sid)
+		return
+	case "cast": // a session with no display of its own (castview.go)
+		h.castPage(w, sid)
+		return
+	case "cast.ws":
+		h.cast(w, r, sid)
 		return
 	}
 	if !h.ok {
