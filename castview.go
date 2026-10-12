@@ -4,10 +4,11 @@ package main
 // (whose headful window WindowServer never shows) or a headless one here.
 // There is no framebuffer to serve over VNC, so the view is built from
 // DevTools instead: Page.startScreencast sends the tab's frames as JPEGs, and
-// what the person does on the page -- mouse, wheel, keys, a paste -- goes back
-// as Input.dispatch* on the same tab. It is served beside the noVNC view under
-// the same token (view.go): /view/<tok>/cast is the page, /view/<tok>/cast.ws
-// its websocket, and the token is the whole of its authentication.
+// what the person does on the page -- mouse, wheel, keys -- goes back as
+// Input.dispatch* on the same tab, and a paste as typing (paste.go). It is
+// served beside the noVNC view under the same token (view.go): /view/<tok>/cast
+// is the page, /view/<tok>/cast.ws its websocket, and the token is the whole
+// of its authentication.
 //
 // The view connects to the browser on a DevTools connection of its own, so
 // it neither shares nor disturbs chromedp's. It follows new tabs as they open
@@ -394,10 +395,35 @@ func (v *caster) input(in castIn) {
 		}
 		v.cc.send(v.ctx, sid, "Input.dispatchKeyEvent", p)
 	case "paste":
-		if in.Text != "" {
-			v.cc.send(v.ctx, sid, "Input.insertText", map[string]any{"text": in.Text})
+		// In line with the keys around it, so an Enter after it waits.
+		v.paste(sid, in.Text)
+	}
+}
+
+// paste types the viewer's clipboard into the tab it shows (paste.go) and
+// tells the viewer how that went.
+func (v *caster) paste(sid target.SessionID, text string) {
+	v.mu.Lock()
+	id := v.target
+	v.mu.Unlock()
+	ctx, cancel := context.WithTimeout(v.ctx, 10*time.Second)
+	defer cancel()
+	var msg string
+	switch {
+	case text == "":
+		msg = "Nothing was pasted: the clipboard has no text"
+	case len(text) > pasteMax:
+		msg = fmt.Sprintf("Nothing was pasted: the text is longer than %d KB", pasteMax>>10)
+	default:
+		f, err := probeFocus(ctx, v.cc, sid, id)
+		if err != nil {
+			msg = "Nothing was pasted: " + err.Error()
+		} else if msg, err = pasteInto(ctx, v.cc, sid, f, text); err != nil {
+			msg = err.Error()
 		}
 	}
+	b, _ := json.Marshal(map[string]any{"t": "paste", "msg": msg})
+	v.ws.Write(v.ctx, websocket.MessageText, b)
 }
 
 // castPage is the viewer: self-contained, as the drop page is (upload.go),
@@ -411,10 +437,10 @@ func (h *viewHandler) castPage(w http.ResponseWriter, sid string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
-	fmt.Fprintf(w, castPageHTML, nonce, sid)
+	fmt.Fprintf(w, castPageHTML, nonce, sid, pasteJS)
 }
 
-// castPageHTML takes: the nonce, the session id.
+// castPageHTML takes: the nonce, the session id, pasteJS.
 const castPageHTML = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -473,9 +499,7 @@ body { display:flex; flex-direction:column }
   screen.addEventListener('mousemove', e => { if (!pending) requestAnimationFrame(() => { mouse('mouseMoved', pending); pending = null; }); pending = e; });
   screen.addEventListener('contextmenu', e => e.preventDefault());
   screen.addEventListener('wheel', e => { e.preventDefault(); const p = at(e); send({t: 'wheel', x: p.x, y: p.y, dx: e.deltaX, dy: e.deltaY, modifiers: mods(e)}); }, {passive: false});
-  const isPaste = e => (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v';
   const key = (type, e) => {
-    if (isPaste(e)) return; // the paste event carries the text instead
     e.preventDefault();
     let text = '';
     if (type === 'keyDown' && !e.ctrlKey && !e.metaKey) text = e.key.length === 1 ? e.key : (e.key === 'Enter' ? '\r' : '');
@@ -483,7 +507,10 @@ body { display:flex; flex-direction:column }
   };
   stage.addEventListener('keydown', e => key('keyDown', e));
   stage.addEventListener('keyup', e => key('keyUp', e));
-  document.addEventListener('paste', e => { e.preventDefault(); send({t: 'paste', text: e.clipboardData.getData('text')}); });
+  // The paste shortcut sends the viewer's clipboard text instead (paste.go).
+  const say = chromemcpPaste(t => t instanceof Node && stage.contains(t), text => { send({t: 'paste', text}); });
+  ws.addEventListener('message', e => { const m = JSON.parse(e.data); if (m.t === 'paste') say(m.msg); });
 })();
+%[3]s
 </script>
 </body></html>`

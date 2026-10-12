@@ -7,6 +7,8 @@ package main
 // tokens are unguessable, short-lived, and bound to one session. This is
 // how the owner logs in to an account inside a session (Google, with its
 // passkeys and 2FA, which no agent can do) before saving it as an identity.
+// The page is noVNC's own vnc.html with a hook added, so that a paste over
+// the screen goes into the session's focused field (paste.go).
 
 import (
 	"context"
@@ -78,12 +80,13 @@ func (v *viewTokens) revokeSession(session string) {
 
 type viewHandler struct {
 	mgr   *manager
+	dir   string // noVNC's
 	files http.Handler
 	ok    bool
 }
 
 func newViewHandler(mgr *manager, novncDir string) *viewHandler {
-	h := &viewHandler{mgr: mgr}
+	h := &viewHandler{mgr: mgr, dir: novncDir}
 	if fi, err := os.Stat(filepath.Join(novncDir, "vnc.html")); err == nil && !fi.IsDir() {
 		h.files = http.FileServer(http.Dir(novncDir))
 		h.ok = true
@@ -119,6 +122,9 @@ func (h *viewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "cast.ws":
 		h.cast(w, r, sid)
 		return
+	case "paste": // the noVNC page's (paste.go)
+		h.paste(w, r, sid)
+		return
 	}
 	if !h.ok {
 		http.Error(w, "noVNC is not installed on this server", http.StatusNotFound)
@@ -131,6 +137,10 @@ func (h *viewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Nothing under noVNC needs to be cached by a browser against a token.
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
+	if path == "vnc.html" {
+		h.vncPage(w, r)
+		return
+	}
 	r2 := r.Clone(r.Context())
 	r2.URL.Path = "/" + path
 	h.files.ServeHTTP(w, r2)

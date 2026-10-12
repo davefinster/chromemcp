@@ -806,7 +806,8 @@ func (a *mcpApp) sessionView(ctx context.Context, req *mcp.CallToolRequest, in s
 	}
 	return text(fmt.Sprintf("Live view of session %s (valid until %s, %s from now):\n%s\n\n"+
 		"Anyone with the link can see and control this browser until then. Whatever they log in to stays in the session; "+
-		"identity_save keeps it for future sessions.",
+		"identity_save keeps it for future sessions. Pasting over the view (Cmd+V on a Mac, Ctrl+V elsewhere) types the viewer's "+
+		"own clipboard -- a password from their password manager -- into the field they clicked.",
 		s.meta.ID, exp.Format(time.RFC3339), time.Until(exp).Round(time.Minute), u)), nil, nil
 }
 

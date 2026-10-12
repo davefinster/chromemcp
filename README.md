@@ -16,7 +16,7 @@ One Go binary, five parts:
 | MCP server | Streamable HTTP (or stdio), OAuth-protected: AuthKit issuer, resource identifier, single-account email pin. 34 tools. |
 | sessions | One Chrome per session on its own profile directory, like the first launch on a clean workstation, with whatever files the agent has put on it for a page's file picker. Ephemeral: parked when idle (Chrome closed, profile kept, resumable), deleted when old. |
 | identities | Named snapshots of a profile the owner has logged into — the persistent part. A session started *as* an identity begins already signed in. |
-| live view | Headful sessions render on an Xvnc display; a token link serves noVNC over the server's own websocket bridge, so a person can watch, take over, and sign in where no agent can (passkeys, 2FA). A session with no display — a node's, or a headless one — gets a screencast view instead: frames from DevTools, mouse and keys sent back. |
+| live view | Headful sessions render on an Xvnc display; a token link serves noVNC over the server's own websocket bridge, so a person can watch, take over, and sign in where no agent can (passkeys, 2FA). A session with no display — a node's, or a headless one — gets a screencast view instead: frames from DevTools, mouse and keys sent back. In either, the paste shortcut types the person's own clipboard (a password from their password manager) into the field that has focus in the session. |
 | nodes | `chromemcp node` on another machine — a Mac — runs sessions' Chrome for the server over mutual TLS, so `device=mac` is a real Mac's Chrome with its own GPU and fonts ([Nodes](#nodes)). |
 
 ## Tools
@@ -151,6 +151,27 @@ claude.ai ──HTTPS──▶ edge ──▶ chromemcp :8787
   unix socket only (a loopback port when the path would be too long for a
   socket), and the bridge dials it per websocket. A connected viewer keeps
   the session from being parked.
+- **Pasting from the viewer's machine** (`paste.go`) is how a person gets a
+  password from their own password manager into a session. Over either view,
+  Cmd+V (Ctrl+V off a Mac) moves the focus for that one keystroke to a hidden
+  text field, so the browser's own paste lands there with no clipboard
+  permission to ask for, and the text goes to the server instead of to the
+  remote screen as keys. noVNC's `vnc.html` is served with that hook added;
+  it `POST`s to `/view/<tok>/paste`, and the screencast view sends it on its
+  websocket. The server types it with `Input.insertText`, which Chrome hands
+  to the focused widget, a field in a cross-origin frame included. It never
+  passes through a clipboard in the session (not Xvnc's, not Chrome's), so
+  nothing is left for a later paste or a middle click, and it is not logged.
+  It goes only where the person put the focus. On noVNC, which shows the
+  whole display, that is the page whose `document.hasFocus()` is true (read
+  in an isolated world, so a page cannot fake it). When none is, the address
+  bar or a dialog of Chrome's own has the focus, and the paste is refused
+  rather than guessed. Either view also refuses when nothing that takes text
+  has the focus, and tells the person which page it pasted into. While a
+  paste is on its way the screen's keys wait, so an Enter pressed straight
+  after a password cannot arrive before it. Other keys, Ctrl+V on a Mac
+  among them, go to the remote as before, and noVNC's own clipboard panel
+  is untouched.
 - **The upload link is the same idea for bytes.** `file_upload_url` mints a
   token of its own — separate from the view tokens, so a link that lets
   someone watch a browser is not a link that lets them put files in it —
@@ -519,11 +540,12 @@ server ── mutual TLS ──▶ tailscale serve --tcp 9310 ──▶ chromemc
 - **The live view of a node session is a screencast** (`castview.go`), since
   there is no framebuffer for VNC: `Page.startScreencast` frames to a small
   page under the same token as the noVNC view (`/view/<tok>/cast`), and the
-  viewer's mouse, wheel, keys and paste go back as `Input.dispatch*`. It
-  follows tabs as they open (a sign-in popup), lists them to switch between,
-  and brings the one it shows to the front. It cannot reach what the page
-  never sees: a native dialog, a passkey on the machine's own authenticator.
-  Any session without a display gets one, headless sessions here included.
+  viewer's mouse, wheel and keys go back as `Input.dispatch*`, and a paste as
+  typing (see the live view above). It follows tabs as they open (a sign-in
+  popup), lists them to switch between, and brings the one it shows to the
+  front. It cannot reach what the page never sees: a native dialog, a passkey
+  on the machine's own authenticator. Any session without a display gets
+  one, headless sessions here included.
 - **`disable_passkeys` for a session someone will sign in through.** A
   security-key or passkey request opens the browser's own WebAuthn dialog,
   which no live view can show, and which on a Mac node holds the page's
@@ -629,9 +651,15 @@ park and resume with the cookie carried back, a Chrome killed on the node
 noticed and relaunched, and deletion reaching the node. `TestNodeMutualTLS`
 and `TestCertReload` need no Chrome: an unlisted certificate, one from
 another CA and none at all are refused, the launch request is bounded, and a
-renewed certificate is served without a restart. They
-skip themselves where there is no Chrome, as in the image's build stage;
-`CHROMEMCP_TEST_NO_CHROME=1` skips them anywhere.
+renewed certificate is served without a restart. `TestPasteViewerCast`
+opens a screencast view in a second session and presses the paste shortcut,
+as on Linux and as on a Mac, then a key straight after it. It checks that the
+session's field gets the text and then the key, and that the viewer says so.
+`TestPasteViewerNoVNC` does the same through noVNC's own page on a headful
+session, but only with `CHROMEMCP_TEST_NOVNC` set to a noVNC directory and an
+Xvnc at hand, which only a workstation has. They skip themselves where there
+is no Chrome, as in the image's build stage; `CHROMEMCP_TEST_NO_CHROME=1`
+skips them anywhere.
 
 ## Licence
 

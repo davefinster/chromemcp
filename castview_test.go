@@ -166,7 +166,30 @@ func TestCastView(t *testing.T) {
 		send(castIn{T: "key", Type: "keyDown", Key: string(ch), Code: "Key" + strings.ToUpper(string(ch)), Text: string(ch)})
 		send(castIn{T: "key", Type: "keyUp", Key: string(ch), Code: "Key" + strings.ToUpper(string(ch))})
 	}
-	send(castIn{T: "paste", Text: " there"})
+	// A paste says how it went, naming the page (retitled by the click); it
+	// goes nowhere once Shift+Tab has moved the focus back to the button.
+	pasted := func(text string) string {
+		t.Helper()
+		send(castIn{T: "paste", Text: text})
+		for {
+			_, data, err := c.Read(ctx)
+			if err != nil {
+				t.Fatalf("waiting for the paste's reply: %v", err)
+			}
+			var m struct{ T, Msg string }
+			if json.Unmarshal(data, &m); m.T == "paste" {
+				return m.Msg
+			}
+		}
+	}
+	if msg := pasted(" there"); msg != "Pasted 6 characters into “clicked”" {
+		t.Errorf("the paste's reply: %q", msg)
+	}
+	send(castIn{T: "key", Type: "keyDown", Key: "Tab", Code: "Tab", KeyCode: 9, Modifiers: 8})
+	send(castIn{T: "key", Type: "keyUp", Key: "Tab", Code: "Tab", KeyCode: 9, Modifiers: 8})
+	if msg := pasted(" nowhere"); !strings.Contains(msg, "click into the text field") {
+		t.Errorf("a paste with the button focused: %q", msg)
+	}
 	var got struct {
 		Title string `json:"title"`
 		Value string `json:"value"`

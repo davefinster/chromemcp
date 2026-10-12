@@ -113,6 +113,10 @@ type session struct {
 	devtools   *devtoolsClient
 	viewers    atomic.Int32 // open live-view connections
 	lastUsed   atomic.Int64 // unix nanos; the meta's copy is written on park
+	// cdpURL is chrome's DevTools URL while it runs, for what must not wait
+	// on s.mu, which an agent's action holds for as long as it runs: a paste
+	// from the live view during a browser_wait for that very sign-in.
+	cdpURL atomic.Pointer[string]
 }
 
 // tab is one attached page target.
@@ -795,6 +799,8 @@ func (s *session) launch(ctx context.Context) error {
 	browserCtx, _ := chromedp.NewContext(allocCtx, opts...)
 
 	s.chrome, s.disp, s.emu = proc, disp, emu
+	u := proc.wsURL()
+	s.cdpURL.Store(&u)
 	s.allocCtx, s.allocStop, s.browserCtx = allocCtx, allocStop, browserCtx
 	s.tabs = map[target.ID]*tab{}
 	s.closing = map[target.ID]time.Time{}
@@ -916,6 +922,7 @@ func (s *session) park() {
 		s.disp.stop()
 	}
 	s.chrome, s.disp, s.emu, s.allocCtx, s.allocStop, s.browserCtx = nil, nil, nil, nil, nil, nil
+	s.cdpURL.Store(nil)
 	s.tabs, s.closing, s.aliases, s.current, s.front = nil, nil, nil, "", ""
 	if err := s.saveMeta(); err != nil {
 		logf("session %s: saving metadata: %v", s.meta.ID, err)
