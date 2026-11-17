@@ -17,7 +17,7 @@ import (
 
 // snapshotJS installs window.__cmcp and returns it. Idempotent per page.
 const snapshotJS = `(() => {
-if (window.__cmcp && window.__cmcp.v === 5) return window.__cmcp;
+if (window.__cmcp && window.__cmcp.v === 6) return window.__cmcp;
 const SEL = 'a[href], button, input, select, textarea, summary, details, label, [role], [contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"], [tabindex], [onclick], h1, h2, h3, h4, h5, h6, img[alt], [aria-label]';
 const SKIP_ROLES = new Set(['presentation', 'none', 'generic', 'document', 'group', 'list', 'listitem', 'table', 'row', 'cell', 'gridcell', 'columnheader', 'rowheader', 'rowgroup', 'region', 'main', 'navigation', 'banner', 'contentinfo', 'complementary', 'form', 'search', 'article', 'section', 'paragraph', 'img', 'figure', 'separator', 'toolbar', 'status', 'log', 'timer', 'marquee', 'tooltip', 'progressbar', 'application', 'feed', 'note', 'definition', 'term', 'directory', 'math', 'code', 'emphasis', 'strong', 'subscript', 'superscript', 'time', 'insertion', 'deletion', 'blockquote', 'caption', 'meter', 'tablist', 'menubar', 'menu', 'listbox', 'radiogroup', 'tree', 'treegrid', 'grid', 'dialog', 'alertdialog', 'alert', 'tabpanel', 'scrollbar']);
 
@@ -32,11 +32,50 @@ function frameOffset(win) {
   let x = 0, y = 0, w = win;
   try {
     while (w && w !== w.parent && w.frameElement) {
-      const r = w.frameElement.getBoundingClientRect();
-      x += r.left; y += r.top; w = w.parent;
+      const fe = w.frameElement, r = fe.getBoundingClientRect();
+      x += r.left + fe.clientLeft; y += r.top + fe.clientTop; w = w.parent;
     }
   } catch (e) {}
   return {x, y};
+}
+// The composed parent: across a shadow root to its host, not out of a frame.
+function parentOf(n) {
+  if (n.parentElement) return n.parentElement;
+  const r = n.getRootNode && n.getRootNode();
+  return r && r.host ? r.host : null;
+}
+// What is under a point of the top viewport, looking into same-origin
+// frames and open shadow roots, as the browser's own hit test does.
+function deepHit(x, y) {
+  let el = document.elementFromPoint(x, y), ox = 0, oy = 0;
+  for (let g = 0; el && g < 32; g++) {
+    if (el.shadowRoot) {
+      const inner = el.shadowRoot.elementFromPoint(x - ox, y - oy);
+      if (inner && inner !== el) { el = inner; continue; }
+    }
+    if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+      let d = null;
+      try { d = el.contentDocument; } catch (e) {}
+      if (!d) break;
+      const r = el.getBoundingClientRect();
+      ox += r.left + el.clientLeft; oy += r.top + el.clientTop;
+      const inner = d.elementFromPoint(x - ox, y - oy);
+      if (!inner) break;
+      el = inner; continue;
+    }
+    break;
+  }
+  return el;
+}
+// Whether n is el or inside it, across shadow roots and frames.
+function within(n, el) {
+  for (let g = 0; n && g < 4096; g++) {
+    if (n === el) return true;
+    let p = parentOf(n);
+    if (!p) { try { p = n.ownerDocument.defaultView.frameElement; } catch (e) { p = null; } }
+    n = p;
+  }
+  return false;
 }
 function visible(el) {
   const st = el.ownerDocument.defaultView.getComputedStyle(el);
@@ -179,7 +218,7 @@ function findByText(text, exact) {
   // Interactive ancestors win: clicking the <a> rather than its <span>.
   return hits.map(el => el.closest('a[href], button, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="option"], label, summary, input, select, textarea') || el);
 }
-function resolve(t) {
+function targetOf(t) {
   let el = null, how = '';
   if (t.ref) {
     const n = parseInt(String(t.ref).replace(/^e/, ''));
@@ -201,14 +240,240 @@ function resolve(t) {
   } else {
     return {error: 'give one of ref, selector or text'};
   }
-  const via = visible(el) ? null : proxyOf(el);
-  try { (via || el).scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'}); } catch (e) {}
-  const r = (via || el).getBoundingClientRect();
+  // What is seen and pointed at: the element, or the label fronting it.
+  const seen = visible(el) ? el : (proxyOf(el) || el);
+  return {el, seen, how};
+}
+function describeEl(el, how, r, off) {
+  return {how, tag: el.tagName.toLowerCase(), role: roleOf(el), name: labelOf(el), box: [Math.round(r.left + off.x), Math.round(r.top + off.y), Math.round(r.width), Math.round(r.height)]};
+}
+// resolve jumps the target into view and gives its middle: the fallback
+// for when a hand cannot get it into view (locate), and the screenshot's.
+function resolve(t) {
+  const f = targetOf(t);
+  if (f.error) return f;
+  const {el, seen, how} = f;
+  try { seen.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'}); } catch (e) {}
+  const r = seen.getBoundingClientRect();
   const off = frameOffset(el.ownerDocument.defaultView);
   if (r.width === 0 && r.height === 0) return {error: 'element ' + how + ' has no size (hidden?)'};
   const x = r.left + off.x + r.width / 2, y = r.top + off.y + r.height / 2;
   if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) return {error: 'element ' + how + ' is outside the viewport after scrolling'};
-  return {x, y, how, tag: el.tagName.toLowerCase(), role: roleOf(el), name: labelOf(el), box: [Math.round(r.left + off.x), Math.round(r.top + off.y), Math.round(r.width), Math.round(r.height)]};
+  return Object.assign(describeEl(el, how, r, off), {x, y});
+}
+// pointOn picks the point of a target in view that a person would click:
+// random, biased to the middle, off the edges, on one of its boxes (a link
+// broken over lines has one per line), and somewhere the target, not
+// something over it, is what is hit. rnd is randomness from the server.
+function pointOn(t, rnd) {
+  const f = targetOf(t);
+  if (f.error) return f;
+  const {el, seen, how} = f;
+  let i = 0;
+  const R = () => rnd[(i++) % rnd.length];
+  const off = frameOffset(seen.ownerDocument.defaultView);
+  const whole = seen.getBoundingClientRect();
+  const out = describeEl(el, how, whole, off);
+  const boxes = [];
+  for (const r of seen.getClientRects()) {
+    const b = {l: Math.max(r.left + off.x, 0), t: Math.max(r.top + off.y, 0), r: Math.min(r.right + off.x, innerWidth), b: Math.min(r.bottom + off.y, innerHeight)};
+    if (b.r - b.l >= 1 && b.b - b.t >= 1) boxes.push(b);
+  }
+  if (!boxes.length) return {error: 'element ' + how + (whole.width || whole.height ? ' is not in the viewport' : ' has no size (hidden?)')};
+  const area = b => (b.r - b.l) * (b.b - b.t);
+  const total = boxes.reduce((a, b) => a + area(b), 0);
+  const pick = () => { let a = R() * total; for (const b of boxes) { a -= area(b); if (a <= 0) return b; } return boxes[boxes.length - 1]; };
+  const gauss = () => Math.sqrt(-2 * Math.log(Math.max(R(), 1e-9))) * Math.cos(2 * Math.PI * R());
+  const inside = (v, lo, hi, pad) => Math.min(Math.max(v, lo + pad), hi - pad);
+  for (let k = 0; k < 16; k++) {
+    const b = pick(), w = b.r - b.l, h = b.b - b.t;
+    const x = inside((b.l + b.r) / 2 + gauss() * w / 6, b.l, b.r, Math.min(4, w * 0.2));
+    const y = inside((b.t + b.b) / 2 + gauss() * h / 6, b.t, b.b, Math.min(4, h * 0.2));
+    if (within(deepHit(x, y), seen)) return Object.assign(out, {x, y});
+  }
+  for (const b of boxes) {
+    const x = (b.l + b.r) / 2, y = (b.t + b.b) / 2;
+    if (within(deepHit(x, y), seen)) return Object.assign(out, {x, y});
+  }
+  // Something covers it everywhere we looked: its middle, as before.
+  const b = boxes.reduce((a, c) => area(c) > area(a) ? c : a);
+  return Object.assign(out, {x: (b.l + b.r) / 2, y: (b.t + b.b) / 2, covered: true});
+}
+// hitsAt is whether a point still lands on the target: pages move.
+function hitsAt(t, x, y) {
+  const f = targetOf(t);
+  return !f.error && within(deepHit(x, y), f.seen);
+}
+// ---- scrolling the way a hand does ----
+function docScroller(win) { const d = win.document; return d.scrollingElement || d.documentElement; }
+function scrollable(el, axis) {
+  const st = el.ownerDocument.defaultView.getComputedStyle(el);
+  if (!/(auto|scroll|overlay)/.test(axis === 'y' ? st.overflowY : st.overflowX)) return false;
+  return axis === 'y' ? el.scrollHeight > el.clientHeight + 1 : el.scrollWidth > el.clientWidth + 1;
+}
+// Whether a wheel over e would move e itself, being able to go that way.
+function absorbs(e, dx, dy, isDoc) {
+  const y = isDoc ? e.scrollHeight > e.clientHeight + 1 : scrollable(e, 'y');
+  const x = isDoc ? e.scrollWidth > e.clientWidth + 1 : scrollable(e, 'x');
+  if (dy && y && (dy > 0 ? e.scrollTop < e.scrollHeight - e.clientHeight - 1 : e.scrollTop > 0)) return true;
+  if (dx && x && (dx > 0 ? e.scrollLeft < e.scrollWidth - e.clientWidth - 1 : e.scrollLeft > 0)) return true;
+  return false;
+}
+function fixedish(el) {
+  for (let n = el; n && n.nodeType === 1; n = parentOf(n)) {
+    if (n.ownerDocument.defaultView.getComputedStyle(n).position === 'fixed') return true;
+  }
+  return false;
+}
+// The scrollers an element is seen through, innermost first: its scrolling
+// ancestors and each document's own, out through the frames.
+function chainOf(el) {
+  const out = [];
+  let n = el, win = el.ownerDocument.defaultView;
+  for (let g = 0; g < 16; g++) {
+    const ds = docScroller(win);
+    for (let p = parentOf(n); p; p = parentOf(p)) {
+      if (p !== ds && (scrollable(p, 'y') || scrollable(p, 'x'))) out.push({el: p, win, doc: false});
+    }
+    out.push({el: ds, win, doc: true});
+    let fe = null;
+    try { fe = win.frameElement; } catch (e) {}
+    if (!fe) break;
+    n = fe; win = fe.ownerDocument.defaultView;
+  }
+  return out;
+}
+// What a scroller shows, in top-viewport coordinates.
+function viewBox(s) {
+  const off = frameOffset(s.win);
+  if (s.doc) {
+    const de = s.win.document.documentElement;
+    return {l: off.x, t: off.y, r: off.x + Math.min(de.clientWidth || Infinity, s.win.innerWidth), b: off.y + Math.min(de.clientHeight || Infinity, s.win.innerHeight)};
+  }
+  const r = s.el.getBoundingClientRect();
+  const l = off.x + r.left + s.el.clientLeft, t = off.y + r.top + s.el.clientTop;
+  return {l, t, r: l + s.el.clientWidth, b: t + s.el.clientHeight};
+}
+function clip(a, b) { return {l: Math.max(a.l, b.l), t: Math.max(a.t, b.t), r: Math.min(a.r, b.r), b: Math.min(a.b, b.b)}; }
+// Whether a span a0..a1 is in a view v0..v1 well enough: all of it, off the
+// very edge, or at least half the view when it is bigger than the view.
+function axisOK(a0, a1, v0, v1) {
+  const vs = v1 - v0, as = a1 - a0, m = Math.min(8, vs * 0.05);
+  if (as <= vs - 2 * m) return a0 >= v0 + m && a1 <= v1 - m;
+  return Math.min(a1, v1) - Math.max(a0, v0) >= Math.min(as, vs) * 0.5;
+}
+// How far to scroll to bring a span to fraction frac of the view (a span
+// too big for it, to its start).
+function need(a0, a1, v0, v1, frac) {
+  if (axisOK(a0, a1, v0, v1)) return 0;
+  const vs = v1 - v0;
+  if (a1 - a0 <= vs * 0.8) return (a0 + a1) / 2 - (v0 + frac * vs);
+  return a0 - (v0 + 0.1 * vs);
+}
+// As far as a scroller can go, of what is asked.
+function roomIn(s, dx, dy) {
+  const e = s.el;
+  const canY = s.doc || scrollable(e, 'y'), canX = s.doc || scrollable(e, 'x');
+  const maxY = e.scrollHeight - e.clientHeight, maxX = e.scrollWidth - e.clientWidth;
+  dy = !canY ? 0 : dy > 0 ? Math.min(dy, maxY - e.scrollTop) : Math.max(dy, -e.scrollTop);
+  dx = !canX ? 0 : dx > 0 ? Math.min(dx, maxX - e.scrollLeft) : Math.max(dx, -e.scrollLeft);
+  return {dx: Math.abs(dx) < 1 ? 0 : dx, dy: Math.abs(dy) < 1 ? 0 : dy};
+}
+// Whether a wheel at a point would scroll s: what is under it is inside s,
+// and nothing between them would take the wheel first.
+function wheelReaches(x, y, s, dx, dy) {
+  let n = deepHit(x, y);
+  if (!n || /^(IFRAME|FRAME|EMBED|OBJECT)$/.test(n.tagName)) return false;
+  for (let g = 0; n && g < 4096; g++) {
+    if (!s.doc && n === s.el) return true;
+    const doc = n.ownerDocument;
+    if (n === doc.documentElement) {
+      const win = doc.defaultView;
+      if (s.doc && s.win === win) return true;
+      if (absorbs(docScroller(win), dx, dy, true)) return false;
+      try { n = win.frameElement; } catch (e) { n = null; }
+      continue;
+    }
+    if (n !== docScroller(doc.defaultView) && absorbs(n, dx, dy, false)) return false;
+    n = parentOf(n);
+  }
+  return false;
+}
+// Where to put the pointer to wheel s: where it is, if that works, as a
+// person does not move the mouse to scroll; else the nearest of a few
+// places in the middle of what s shows that work.
+function wheelPoint(s, eff, dx, dy, cur, R) {
+  if (cur && cur.x >= eff.l + 2 && cur.x <= eff.r - 2 && cur.y >= eff.t + 2 && cur.y <= eff.b - 2 && wheelReaches(cur.x, cur.y, s, dx, dy)) return {x: cur.x, y: cur.y, stay: true};
+  const w = eff.r - eff.l, h = eff.b - eff.t;
+  let best = null, bestD = Infinity;
+  for (let k = 0, found = 0; k < 24 && found < 6; k++) {
+    const x = eff.l + w * (0.2 + 0.6 * R()), y = eff.t + h * (0.2 + 0.6 * R());
+    if (!wheelReaches(x, y, s, dx, dy)) continue;
+    found++;
+    const d = cur ? Math.hypot(x - cur.x, y - cur.y) : 0;
+    if (d < bestD) { best = {x, y}; bestD = d; }
+  }
+  return best || {x: eff.l + w / 2, y: eff.t + h / 2};
+}
+// locate says whether a target is in view, and if not, the next scroll a
+// person would make toward it: which scroller (the innermost that does not
+// show it; that scroller's own, first, if it is out of sight itself), by
+// how much, to bring it to fractions fr of the view, and where to wheel.
+function locate(t, cur, fr, rnd) {
+  const f = targetOf(t);
+  if (f.error) return f;
+  const {seen, how} = f;
+  let i = 0;
+  const R = () => rnd[(i++) % rnd.length];
+  const r0 = seen.getBoundingClientRect();
+  if (r0.width === 0 && r0.height === 0) return {error: 'element ' + how + ' has no size (hidden?)'};
+  const off = frameOffset(seen.ownerDocument.defaultView);
+  let want = {l: r0.left + off.x, t: r0.top + off.y, r: r0.right + off.x, b: r0.bottom + off.y};
+  const box = [Math.round(want.l), Math.round(want.t), Math.round(r0.width), Math.round(r0.height)];
+  if (fixedish(seen)) return {inView: true, box};
+  const chain = chainOf(seen), views = chain.map(viewBox);
+  const top = {l: 0, t: 0, r: innerWidth, b: innerHeight};
+  for (let k = 0; k < chain.length; k++) {
+    const vb = views[k];
+    if (axisOK(want.l, want.r, vb.l, vb.r) && axisOK(want.t, want.b, vb.t, vb.b)) continue;
+    let eff = clip(vb, top);
+    for (let j = k + 1; j < chain.length; j++) eff = clip(eff, views[j]);
+    if (eff.r - eff.l >= 24 && eff.b - eff.t >= 24) {
+      const room = roomIn(chain[k], need(want.l, want.r, vb.l, vb.r, fr[0]), need(want.t, want.b, vb.t, vb.b, fr[1]));
+      if (room.dx || room.dy) {
+        const at = wheelPoint(chain[k], eff, room.dx, room.dy, cur, R);
+        return {box, dx: Math.round(room.dx), dy: Math.round(room.dy), x: at.x, y: at.y, stay: !!at.stay};
+      }
+      continue; // it goes no further that way: as good as this one gets
+    }
+    want = vb; // this scroller is out of sight itself: show it first
+  }
+  return {inView: true, box};
+}
+// pageScroll is where to wheel to scroll the page by dx, dy, and how far it
+// can go: the document if it can go that way, else the biggest scroller in
+// view that can (an app whose body is fixed and whose main pane scrolls).
+function pageScroll(cur, dx, dy, rnd) {
+  let i = 0;
+  const R = () => rnd[(i++) % rnd.length];
+  const top = {l: 0, t: 0, r: innerWidth, b: innerHeight};
+  const area = b => Math.max(0, b.r - b.l) * Math.max(0, b.b - b.t);
+  let s = {el: docScroller(window), win: window, doc: true};
+  if (!absorbs(s.el, dx, dy, true)) {
+    let best = null, bestA = 0;
+    for (const el of walk(document)) {
+      if (el.scrollHeight <= el.clientHeight + 1 && el.scrollWidth <= el.clientWidth + 1) continue;
+      if (!absorbs(el, dx, dy, false)) continue;
+      const c = {el, win: window, doc: false}, a = area(clip(viewBox(c), top));
+      if (a > bestA) { best = c; bestA = a; }
+    }
+    if (!best) return {none: true};
+    s = best;
+  }
+  const eff = clip(viewBox(s), top);
+  const room = roomIn(s, dx, dy);
+  const at = wheelPoint(s, eff, room.dx || dx, room.dy || dy, cur, R);
+  return {x: at.x, y: at.y, stay: !!at.stay, dx: Math.round(room.dx), dy: Math.round(room.dy)};
 }
 function elementOf(t) {
   if (t.ref) { const n = parseInt(String(t.ref).replace(/^e/, '')); return (window.__cmcpRefs || [])[n - 1] || null; }
@@ -340,7 +605,7 @@ function readText(sel, max) {
   if (max && text.length > max) text = text.slice(0, max);
   return {url: location.href, title: document.title, text, total, truncated: total > text.length};
 }
-window.__cmcp = {v: 5, snapshot, resolve, clearField, selectOption, label, readText, fileTarget, fileInputState};
+window.__cmcp = {v: 6, snapshot, resolve, pointOn, hitsAt, locate, pageScroll, clearField, selectOption, label, readText, fileTarget, fileInputState};
 return window.__cmcp;
 })()`
 

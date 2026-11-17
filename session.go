@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -111,6 +112,8 @@ type session struct {
 	current    target.ID
 	front      target.ID // the tab last brought to the front (headless hides the others)
 	devtools   *devtoolsClient
+	rng        *mrand.Rand  // the hand's randomness (human.go), under mu
+	ptr        pointer      // where the mouse is (human.go); its own lock
 	viewers    atomic.Int32 // open live-view connections
 	lastUsed   atomic.Int64 // unix nanos; the meta's copy is written on park
 	// What the live view reads, kept outside s.mu, because an agent's action
@@ -945,6 +948,7 @@ func (s *session) park() {
 	s.chrome, s.disp, s.emu, s.allocCtx, s.allocStop, s.browserCtx = nil, nil, nil, nil, nil, nil
 	s.cdpURL.Store(nil)
 	s.vnc.Store(nil)
+	s.ptr.forget()
 	s.tabs, s.closing, s.aliases, s.front = nil, nil, nil, ""
 	s.setCurrent("")
 	if err := s.saveMeta(); err != nil {

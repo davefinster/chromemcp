@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -534,7 +535,8 @@ func (a *mcpApp) register(s *mcp.Server) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "browser_click",
 		Description: "Click an element — by ref (from browser_snapshot), by visible text, by CSS selector — or at viewport coordinates. " +
-			"A real mouse click at the element's centre after scrolling it into view.",
+			"The session's one mouse pointer moves there as a hand moves it, scrolling the element into view with swipes if it is off screen, " +
+			"and clicks a random point on it (an exact point when given coordinates), so the page sees a person's mouse.",
 		Annotations: acts("Click"),
 	}, a.click)
 	mcp.AddTool(s, &mcp.Tool{
@@ -550,12 +552,12 @@ func (a *mcpApp) register(s *mcp.Server) {
 	}, a.press)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "browser_hover",
-		Description: "Move the mouse over an element (or a point), for menus and tooltips that open on hover.",
+		Description: "Move the mouse over an element (or a point), for menus and tooltips that open on hover. The pointer stays there for the next action.",
 		Annotations: acts("Hover"),
 	}, a.hover)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "browser_scroll",
-		Description: "Scroll the page (or the element under the target) with the mouse wheel; or scroll an element into view by giving it as the target with no direction.",
+		Description: "Scroll the page (or the element under the target) with trackpad-like swipes of the wheel; or scroll an element into view by giving it as the target with no direction.",
 		Annotations: acts("Scroll"),
 	}, a.scroll)
 	mcp.AddTool(s, &mcp.Tool{
@@ -1141,11 +1143,11 @@ func (a *mcpApp) screenshot(ctx context.Context, req *mcp.CallToolRequest, in sc
 	err := a.mgr.withTab(ctx, in.SessionID, in.Tab, func(ctx context.Context, s *session, t *tab) error {
 		o := screenshotOpts{FullPage: in.FullPage, Format: in.Format, Quality: in.Quality, Scale: in.Scale, Labels: in.Labels}
 		if !in.targetSpec.empty() {
-			res, err := resolveTarget(ctx, t, in.targetSpec)
+			res, err := s.reach(ctx, t, in.targetSpec)
 			if err != nil {
 				return err
 			}
-			// The element sits in the viewport after resolve scrolled it there.
+			// The element sits in the viewport after reach scrolled it there.
 			box := res.Box
 			pad := 8
 			box[0] -= pad
@@ -1185,6 +1187,9 @@ func (a *mcpApp) click(ctx context.Context, req *mcp.CallToolRequest, in clickIn
 	if err != nil {
 		return nil, nil, err
 	}
+	if _, _, err := mouseButton(in.Button); err != nil {
+		return nil, nil, err
+	}
 	count := 1
 	if in.Double {
 		count = 2
@@ -1194,16 +1199,20 @@ func (a *mcpApp) click(ctx context.Context, req *mcp.CallToolRequest, in clickIn
 		var x, y float64
 		var what string
 		if in.X != nil && in.Y != nil {
-			x, y, what = *in.X, *in.Y, fmt.Sprintf("(%g, %g)", x, y)
+			x, y = *in.X, *in.Y
+			what = fmt.Sprintf("(%g, %g)", x, y)
+			if err := s.moveTo(ctx, t, pt{x, y}, 0); err != nil {
+				return fmt.Errorf("click: %w", err)
+			}
 		} else {
-			res, err := resolveTarget(ctx, t, in.targetSpec)
+			res, err := s.pointAt(ctx, t, in.targetSpec)
 			if err != nil {
 				return err
 			}
 			x, y, what = res.X, res.Y, res.describe()
 		}
 		before := len(s.tabs)
-		if err := clickAt(ctx, t, x, y, in.Button, count, mods); err != nil {
+		if err := s.press(ctx, t, in.Button, count, mods); err != nil {
 			return fmt.Errorf("click: %w", err)
 		}
 		time.Sleep(300 * time.Millisecond)
@@ -1228,11 +1237,11 @@ func (a *mcpApp) typeText(ctx context.Context, req *mcp.CallToolRequest, in type
 	r := &result{}
 	err := a.mgr.withTab(ctx, in.SessionID, in.Tab, func(ctx context.Context, s *session, t *tab) error {
 		if !in.targetSpec.empty() {
-			res, err := resolveTarget(ctx, t, in.targetSpec)
+			res, err := s.pointAt(ctx, t, in.targetSpec)
 			if err != nil {
 				return err
 			}
-			if err := clickAt(ctx, t, res.X, res.Y, "left", 1, 0); err != nil {
+			if err := s.press(ctx, t, "left", 1, 0); err != nil {
 				return fmt.Errorf("focusing %s: %w", res.describe(), err)
 			}
 			r.addf("into %s", res.describe())
@@ -1319,16 +1328,17 @@ func (a *mcpApp) hover(ctx context.Context, req *mcp.CallToolRequest, in hoverIn
 		var x, y float64
 		var what string
 		if in.X != nil && in.Y != nil {
-			x, y, what = *in.X, *in.Y, fmt.Sprintf("(%g, %g)", x, y)
+			x, y = *in.X, *in.Y
+			what = fmt.Sprintf("(%g, %g)", x, y)
+			if err := s.moveTo(ctx, t, pt{x, y}, 0); err != nil {
+				return fmt.Errorf("hover: %w", err)
+			}
 		} else {
-			res, err := resolveTarget(ctx, t, in.targetSpec)
+			res, err := s.pointAt(ctx, t, in.targetSpec)
 			if err != nil {
 				return err
 			}
 			x, y, what = res.X, res.Y, res.describe()
-		}
-		if err := hoverAt(ctx, t, x, y); err != nil {
-			return fmt.Errorf("hover: %w", err)
 		}
 		time.Sleep(300 * time.Millisecond)
 		r.addf("hovering %s at (%.0f, %.0f)", what, x, y)
@@ -1347,17 +1357,19 @@ func (a *mcpApp) scroll(ctx context.Context, req *mcp.CallToolRequest, in scroll
 		if err != nil {
 			return err
 		}
-		x, y := float64(w)/2, float64(h)/2
-		if !in.targetSpec.empty() {
-			res, err := resolveTarget(ctx, t, in.targetSpec)
-			if err != nil {
-				return err
-			}
-			x, y = res.X, res.Y
+		targeted := !in.targetSpec.empty()
+		if targeted {
 			if in.Direction == "" {
+				res, err := s.reach(ctx, t, in.targetSpec)
+				if err != nil {
+					return err
+				}
 				r.addf("scrolled %s into view", res.describe())
-				time.Sleep(200 * time.Millisecond)
 				return a.finish(ctx, s, t, r, in.wantShot(), screenshotOpts{})
+			}
+			// Scrolling inside it: the pointer goes over it first.
+			if _, err := s.pointAt(ctx, t, in.targetSpec); err != nil {
+				return err
 			}
 		}
 		amount := float64(in.Amount)
@@ -1390,10 +1402,16 @@ func (a *mcpApp) scroll(ctx context.Context, req *mcp.CallToolRequest, in scroll
 		default:
 			return fmt.Errorf("direction %q: want up, down, left or right", in.Direction)
 		}
-		if err := scrollBy(ctx, t, x, y, dx, dy); err != nil {
+		if targeted {
+			err = s.wheel(ctx, t, dx, dy)
+		} else {
+			dx, dy, err = s.scrollPage(ctx, t, dx, dy)
+			amount = math.Abs(dx + dy) // one of them is 0
+		}
+		if err != nil {
 			return fmt.Errorf("scroll: %w", err)
 		}
-		time.Sleep(400 * time.Millisecond) // smooth scrolling and lazy loads
+		time.Sleep(200 * time.Millisecond) // lazy loads
 		var pos [2]int
 		evalJSON(ctx, t, "[Math.round(scrollX), Math.round(scrollY)]", &pos)
 		r.addf("scrolled %s by %.0f px; page now at (%d, %d)", dir, amount, pos[0], pos[1])
@@ -1411,6 +1429,10 @@ func (a *mcpApp) selectOption(ctx context.Context, req *mcp.CallToolRequest, in 
 		if in.targetSpec.empty() {
 			return fmt.Errorf("give the <select> as ref, selector or text")
 		}
+		// The pointer goes to it, as a hand does to choose. Not clicked: that
+		// opens the browser's own list, which pages never see. A select a
+		// custom drop-down hides is chosen all the same.
+		s.pointAt(ctx, t, in.targetSpec)
 		var res struct {
 			Error    string `json:"error"`
 			Selected string `json:"selected"`
@@ -1464,13 +1486,13 @@ func (a *mcpApp) upload(ctx context.Context, req *mcp.CallToolRequest, in upload
 			}
 			r.addf("gave %s to %s", what, info.describe())
 		case "chooser":
-			res, err := resolveTarget(ctx, t, in.targetSpec)
+			res, err := s.pointAt(ctx, t, in.targetSpec)
 			if err != nil {
 				return err
 			}
 			r.addf("%s is no file input, so its file chooser was caught instead", res.describe())
 			if err := setFilesViaChooser(ctx, t, paths, func() error {
-				return clickAt(ctx, t, res.X, res.Y, "left", 1, 0)
+				return s.press(ctx, t, "left", 1, 0)
 			}); err != nil {
 				return err
 			}

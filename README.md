@@ -72,9 +72,9 @@ screenshot, `screenshot=false` turns it off)
 | `browser_navigate`, `browser_history` | go to a URL; back / forward / reload |
 | `browser_snapshot` | the page's interactive elements with a ref each (`e12`), role, label, value, position; `labels=true` draws them on a screenshot |
 | `browser_screenshot` | viewport, full page, or one element; jpeg/png, quality, downscale, ref labels |
-| `browser_click`, `browser_hover` | by ref, visible text, CSS selector, or viewport coordinates; real mouse events |
+| `browser_click`, `browser_hover` | by ref, visible text, CSS selector, or viewport coordinates; the pointer moves there as a hand does and clicks a random point on the element |
 | `browser_type`, `browser_press`, `browser_select` | type into a field (optionally clear, submit); press keys with modifiers; choose a `<select>` option |
-| `browser_scroll` | wheel-scroll the page, or bring an element into view |
+| `browser_scroll` | scroll the page with trackpad-like wheel swipes, or bring an element into view |
 | `browser_upload` | give the page files from the session (`file_list` shows them, put or downloaded) as the file dialog would — the input itself, a hidden one behind its label, or the button whose file chooser is caught |
 | `browser_wait` | a delay, or until an element / text appears (or disappears), or the URL changes |
 | `browser_read` | the page's rendered text — cheap, no screenshot |
@@ -125,6 +125,22 @@ claude.ai ──HTTPS──▶ edge ──▶ chromemcp :8787
   by text finds the innermost visible match and promotes it to its link or
   button. Visually hidden native controls fronted by a styled label (the
   usual custom checkbox) are reported and clicked through the label.
+- **Input comes from a hand** (`human.go`). A session has one mouse pointer
+  for all its tabs, and the live view moves it too. Every click, hover and
+  focus-to-type moves the pointer to the target along a curved path, with a
+  Fitts's-law duration, a minimum-jerk speed profile and a hand's tremor.
+  Long moves sometimes land short or long and correct. The click lands on a
+  random point of the element, biased to its middle and hit-tested so the
+  element is what is clicked. The press waits a moment and holds the button
+  as a finger does, with `buttons` set. A target off screen, in the page or
+  in a scrolling box or frame, is brought into view with trackpad swipes: a
+  burst of wheel events that ramps up and decays like momentum, made over
+  the scroller that holds it, where the pointer is if a wheel there reaches
+  it. A page that takes the wheel for itself gets the old jump after two
+  swipes that move nothing. Movement is sampled against the clock, so a slow
+  DevTools link (a node's) sends fewer events at the same speed. Coordinates
+  given to `browser_click` are clicked exactly. Typing is still one input
+  event per call.
 - **Headless tabs that are not in front are hidden** to Chrome and stop
   rendering — a screenshot of one waits for a frame that never comes. Every
   operation brings its tab to the front first.
@@ -350,8 +366,9 @@ canvas and audio rendering, the media devices and speech voices, and above
 all the WebGL *rendering* — the renderer string says GeForce, but the pixels
 and the capabilities behind it are SwiftShader's, which a script that hashes a
 WebGL draw or reads its limits can still tell apart from real hardware. Nor
-does it supply human behaviour: mouse movement, timing and interaction
-history. Anti-bot services that weigh those — Cloudflare, and the
+does it supply all of a person's behaviour: the pointer and scrolling are a
+hand's (above), but typing has no keystroke rhythm and a fresh profile has no
+interaction history. Anti-bot services that weigh those — Cloudflare, and the
 PerimeterX/HUMAN "press and hold" that Walmart runs — can still challenge a
 session the fingerprint alone would pass, especially a "cold" one with no
 interaction, and their verdict is probabilistic and reputation-weighted. The
@@ -636,7 +653,11 @@ popup (where the platform hint on the popup's own first navigation is checked,
 the request-interception path), after a park and resume, and (with an Xvnc on
 PATH) headful, including the framed outer-window size and that the `fantasy`
 generic measures narrower than `system-ui`; and the `linux` profile's brand
-list against the algorithm; and `TestUploadIntegration` / `TestUploadTools`:
+list against the algorithm; and `TestHumanInput` / `TestHumanTools`: what a
+page records of the hand, which is a curved path that slows onto the target,
+press points that differ, a held button, swipes of uneven size that add up to
+what was asked, and a button in a scrolling box wheeled to over the box, then
+the same through the tools; and `TestUploadIntegration` / `TestUploadTools`:
 the three shapes a site asks for a file in — a plain input, a hidden one
 behind its styled label, and a button that builds its input only when
 clicked — checked by what the page's own `change` handler reports, the

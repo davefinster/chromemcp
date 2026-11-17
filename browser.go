@@ -212,6 +212,9 @@ type resolved struct {
 	Role  string  `json:"role"`
 	Name  string  `json:"name"`
 	Box   [4]int  `json:"box"`
+	// Covered: pointOn found no point where the target is what is hit, so
+	// this is its middle under whatever covers it.
+	Covered bool `json:"covered"`
 }
 
 func (r *resolved) describe() string {
@@ -241,7 +244,8 @@ func resolveTarget(ctx context.Context, t *tab, spec targetSpec) (*resolved, err
 	return &r, nil
 }
 
-// clickAt dispatches a real mouse click at viewport coordinates.
+// clickAt dispatches a click at viewport coordinates at once, with no
+// hand in it: the tools click with session.pointAt and press (human.go).
 func clickAt(ctx context.Context, t *tab, x, y float64, button string, count int, mods input.Modifier) error {
 	var btn input.MouseButton
 	switch strings.ToLower(button) {
@@ -273,12 +277,6 @@ func clickAt(ctx context.Context, t *tab, x, y float64, button string, count int
 			return nil
 		}),
 	)
-}
-
-func hoverAt(ctx context.Context, t *tab, x, y float64) error {
-	cctx, cancel := context.WithTimeout(t.ctx, 10*time.Second)
-	defer cancel()
-	return chromedp.Run(cctx, chromedp.MouseEvent(input.MouseMoved, x, y))
 }
 
 // insertText types into whatever has focus, as an IME would: one input
@@ -371,16 +369,6 @@ func pressKey(ctx context.Context, t *tab, k *kb.Key, mods input.Modifier) error
 			return err
 		}
 		return up.Do(ctx)
-	}))
-}
-
-// scrollBy sends a wheel event at a point; pages that lazy-load react to
-// it the way they react to a person.
-func scrollBy(ctx context.Context, t *tab, x, y, dx, dy float64) error {
-	cctx, cancel := context.WithTimeout(t.ctx, 10*time.Second)
-	defer cancel()
-	return chromedp.Run(cctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		return input.DispatchMouseEvent(input.MouseWheel, x, y).WithDeltaX(dx).WithDeltaY(dy).Do(ctx)
 	}))
 }
 

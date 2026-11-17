@@ -362,12 +362,16 @@ func (v *caster) input(in castIn) {
 		default:
 			return
 		}
+		// The person's hand is on the session's one mouse: the agent's next
+		// move starts from here (human.go).
+		v.s.ptr.set(pt{in.X, in.Y})
 		p := map[string]any{"type": in.Type, "x": in.X, "y": in.Y, "modifiers": in.Modifiers, "buttons": in.Buttons}
 		if in.Type != "mouseMoved" {
 			p["button"], p["clickCount"] = in.Button, in.ClickCount
 		}
 		v.cc.send(v.ctx, sid, "Input.dispatchMouseEvent", p)
 	case "wheel":
+		v.s.ptr.set(pt{in.X, in.Y})
 		v.cc.send(v.ctx, sid, "Input.dispatchMouseEvent", map[string]any{
 			"type": "mouseWheel", "x": in.X, "y": in.Y, "deltaX": in.DX, "deltaY": in.DY, "modifiers": in.Modifiers})
 	case "key":
