@@ -389,7 +389,7 @@ func (v *caster) input(in castIn) {
 			return
 		}
 		p := map[string]any{"type": typ, "key": in.Key, "code": in.Code, "modifiers": in.Modifiers,
-			"windowsVirtualKeyCode": in.KeyCode, "nativeVirtualKeyCode": in.KeyCode}
+			"windowsVirtualKeyCode": in.KeyCode} // no native code: keyParams (typing.go) says why
 		if typ == "keyDown" {
 			p["text"], p["unmodifiedText"] = in.Text, in.Text
 		}

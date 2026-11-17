@@ -43,7 +43,7 @@ const typeMax = 160
 // keyDef is a key as a keyboard reports it.
 type keyDef struct {
 	key, code, text, unmod string
-	vk                     int64 // keyCode, as on Windows; also the native code
+	vk                     int64 // keyCode, as on Windows (never the native code: keyParams)
 	location               int64 // 1 for the left-hand modifier keys
 	shift                  bool  // typed with Shift
 }
@@ -288,7 +288,13 @@ func keyParams(e keyEvent) (string, map[string]any) {
 		return "Input.insertText", map[string]any{"text": e.insert}
 	}
 	k := e.key
-	p := map[string]any{"key": k.key, "code": k.code, "windowsVirtualKeyCode": k.vk, "nativeVirtualKeyCode": k.vk, "modifiers": e.mods}
+	// No nativeVirtualKeyCode: on macOS Chrome rebuilds the native event
+	// from it, and a Windows code there names another key (17, Control, is
+	// the T key; 65, a, the keypad's period). The mismatch looped on the
+	// node's Chrome with a modifier held, flooding keydowns until the browser
+	// hung. Chrome works the native event out from key and code instead,
+	// which is what Puppeteer and Playwright rely on.
+	p := map[string]any{"key": k.key, "code": k.code, "windowsVirtualKeyCode": k.vk, "modifiers": e.mods}
 	if k.location != 0 {
 		p["location"] = k.location
 	}

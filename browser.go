@@ -351,7 +351,6 @@ func pressKey(ctx context.Context, t *tab, k *kb.Key, mods input.Modifier) error
 		Key:                   k.Key,
 		Code:                  k.Code,
 		WindowsVirtualKeyCode: k.Windows,
-		NativeVirtualKeyCode:  k.Native,
 		Modifiers:             mods,
 	}
 	if k.Text != "" && mods&^input.ModifierShift == 0 {

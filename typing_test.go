@@ -185,6 +185,15 @@ func TestPlanChord(t *testing.T) {
 	if p["type"] != "keyDown" || p["text"] != "A" || p["windowsVirtualKeyCode"] != int64(65) {
 		t.Errorf("A down: %v", p)
 	}
+	// Never a native code: macOS reads a Windows one as another key, and on
+	// the node a held modifier then looped until Chrome hung.
+	for _, k := range []keyDef{shiftKey, modifierKeys[0].key, fromKB(kb.Keys['a']), fromKB(kb.Keys['\r'])} {
+		for _, down := range []bool{true, false} {
+			if _, p := keyParams(keyEvent{down: down, key: k}); p["nativeVirtualKeyCode"] != nil {
+				t.Errorf("%s carries a native code: %v", k.key, p)
+			}
+		}
+	}
 }
 
 const typingTestPage = `<!doctype html><html><head><title>Typing</title></head><body>
