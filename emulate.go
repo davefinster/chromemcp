@@ -199,6 +199,16 @@ func (cc *cdpConn) issue(ctx context.Context, sessionID target.SessionID, method
 	return id, nil
 }
 
+// dead reports whether the connection has ended.
+func (cc *cdpConn) dead() bool {
+	select {
+	case <-cc.closed:
+		return true
+	default:
+		return false
+	}
+}
+
 func (cc *cdpConn) close() {
 	cc.c.Close(websocket.StatusNormalClosure, "")
 	<-cc.closed

@@ -114,6 +114,7 @@ type session struct {
 	devtools   *devtoolsClient
 	rng        *mrand.Rand  // the hand's randomness (human.go), under mu
 	ptr        pointer      // where the mouse is (human.go); its own lock
+	hand       *handLink    // the hand's own DevTools connection (human.go), under mu
 	viewers    atomic.Int32 // open live-view connections
 	lastUsed   atomic.Int64 // unix nanos; the meta's copy is written on park
 	// What the live view reads, kept outside s.mu, because an agent's action
@@ -936,6 +937,7 @@ func (s *session) park() {
 		// are consistent for a resume or an identity snapshot.
 		s.chrome.stop(5 * time.Second)
 	}
+	s.closeHand()
 	if s.emu != nil {
 		s.emu.close()
 	}

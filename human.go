@@ -31,8 +31,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto"
 	"github.com/chromedp/cdproto/input"
-	"github.com/chromedp/chromedp"
+	"github.com/chromedp/cdproto/target"
 )
 
 type pt struct{ X, Y float64 }
@@ -289,8 +290,108 @@ func (s *session) tick() time.Duration {
 	return uniformDur(s.rand(), 12*time.Millisecond, 20*time.Millisecond)
 }
 
+// ---- the hand's connection ----
+
+// handLink is the session's own DevTools connection for the hand's
+// reports. They go out at the hand's pace without waiting for each reply,
+// as a mouse does not wait for the page, in order on one connection. Over
+// a node's link a reply takes a round trip of about 100 ms. Waiting for
+// each, as chromedp's commands do, spaced the reports by that, so a move
+// was a handful of jumps and a swipe a few huge wheel events. Under s.mu.
+type handLink struct {
+	url  string
+	cc   *cdpConn
+	sids map[target.ID]target.SessionID
+}
+
+// hand is the hand's connection to one tab.
+type hand struct {
+	cc  *cdpConn
+	sid target.SessionID
+}
+
+func (h hand) send(ctx context.Context, method string, params map[string]any) <-chan error {
+	return h.cc.send(ctx, h.sid, method, params)
+}
+
+// handOn is the hand's connection to a tab: dialled on first use, again
+// when Chrome has changed under it, attached to each tab once.
+func (s *session) handOn(ctx context.Context, t *tab) (hand, error) {
+	u := s.cdpURL.Load()
+	if u == nil {
+		return hand{}, errors.New("chrome is not running")
+	}
+	if s.hand != nil && (s.hand.url != *u || s.hand.cc.dead()) {
+		s.closeHand()
+	}
+	if s.hand == nil {
+		cc, err := dialCDP(ctx, *u, logf)
+		if err != nil {
+			return hand{}, fmt.Errorf("the hand's devtools connection: %w", err)
+		}
+		go cc.events(func(*cdproto.Message) {}) // nothing is enabled on it; what comes is let go
+		s.hand = &handLink{url: *u, cc: cc, sids: map[target.ID]target.SessionID{}}
+	}
+	for id := range s.hand.sids {
+		if _, ok := s.tabs[id]; !ok {
+			delete(s.hand.sids, id) // a closed tab's
+		}
+	}
+	if sid, ok := s.hand.sids[t.id]; ok {
+		return hand{s.hand.cc, sid}, nil
+	}
+	var res struct {
+		SessionID target.SessionID `json:"sessionId"`
+	}
+	if err := s.hand.cc.call(ctx, "", "Target.attachToTarget", map[string]any{"targetId": t.id, "flatten": true}, &res); err != nil {
+		return hand{}, fmt.Errorf("attaching the hand to the tab: %w", err)
+	}
+	s.hand.sids[t.id] = res.SessionID
+	return hand{s.hand.cc, res.SessionID}, nil
+}
+
+// closeHand closes the hand's connection; the next action dials anew.
+func (s *session) closeHand() {
+	if s.hand != nil {
+		s.hand.cc.close()
+		s.hand = nil
+	}
+}
+
+// taken waits for every report sent to have been taken by the page, and
+// gives the first error. A failed sequence forgets the tab's attachment,
+// so the next action attaches again.
+func (s *session) taken(ctx context.Context, t *tab, sent []<-chan error) error {
+	var first error
+wait:
+	for _, c := range sent {
+		select {
+		case err := <-c:
+			if err != nil && first == nil {
+				first = err
+			}
+		case <-ctx.Done():
+			if first == nil {
+				first = ctx.Err()
+			}
+			break wait
+		}
+	}
+	if first != nil && s.hand != nil {
+		delete(s.hand.sids, t.id)
+	}
+	return first
+}
+
+func mouseEvent(typ string, at pt) map[string]any {
+	return map[string]any{"type": typ, "x": at.X, "y": at.Y, "pointerType": "mouse"}
+}
+
+// ---- the hand's reports ----
+
 // moveTo moves the pointer to a point along a hand's path. width is the
-// size of what is there (for the time it takes); 0 for a bare point.
+// size of what is there (for the time it takes); 0 for a bare point. It
+// returns once the page has taken the whole move.
 func (s *session) moveTo(ctx context.Context, t *tab, to pt, width float64) error {
 	w, h, err := viewportSize(ctx, t)
 	if err != nil {
@@ -308,43 +409,44 @@ func (s *session) moveTo(ctx context.Context, t *tab, to pt, width float64) erro
 		width = 12
 	}
 	strokes := planMove(s.rand(), from.clamp(vw, vh), to, width)
-	cctx, cancel := context.WithTimeout(t.ctx, 15*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	return chromedp.Run(cctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		last, sent := from, false
-		for _, st := range strokes {
-			if err := sleepCtx(ctx, st.pause); err != nil {
+	hd, err := s.handOn(cctx, t)
+	if err != nil {
+		return err
+	}
+	var sent []<-chan error
+	report := func(p pt) {
+		sent = append(sent, hd.send(cctx, "Input.dispatchMouseEvent", mouseEvent("mouseMoved", p)))
+		s.ptr.set(p)
+	}
+	last, moved := from, false
+	for _, st := range strokes {
+		if err := sleepCtx(cctx, st.pause); err != nil {
+			return err
+		}
+		start := time.Now()
+		for {
+			u := math.Min(1, float64(time.Since(start))/float64(st.dur))
+			p := st.at(u).clamp(vw, vh).round()
+			// A still mouse reports nothing.
+			if p.dist(last) >= 0.5 || (u == 1 && !moved) {
+				report(p)
+				last, moved = p, true
+			}
+			if u == 1 {
+				break
+			}
+			if err := sleepCtx(cctx, s.tick()); err != nil {
 				return err
 			}
-			start := time.Now()
-			for {
-				u := math.Min(1, float64(time.Since(start))/float64(st.dur))
-				p := st.at(u).clamp(vw, vh).round()
-				// A still mouse reports nothing.
-				if p.dist(last) >= 0.5 || (u == 1 && !sent) {
-					if err := input.DispatchMouseEvent(input.MouseMoved, p.X, p.Y).WithPointerType(input.Mouse).Do(ctx); err != nil {
-						return err
-					}
-					s.ptr.set(p)
-					last, sent = p, true
-				}
-				if u == 1 {
-					break
-				}
-				if err := sleepCtx(ctx, s.tick()); err != nil {
-					return err
-				}
-			}
 		}
-		if !sent {
-			// Already there; still, the page hears the mouse arrive.
-			if err := input.DispatchMouseEvent(input.MouseMoved, to.X, to.Y).WithPointerType(input.Mouse).Do(ctx); err != nil {
-				return err
-			}
-			s.ptr.set(to)
-		}
-		return nil
-	}))
+	}
+	if !moved {
+		// Already there; still, the page hears the mouse arrive.
+		report(to)
+	}
+	return s.taken(cctx, t, sent)
 }
 
 // mouseButton parses a button name.
@@ -362,7 +464,8 @@ func mouseButton(name string) (input.MouseButton, int64, error) {
 
 // press clicks where the pointer is: a moment's settling first, the button
 // held as long as a finger holds it, and a double click's two clicks a
-// person's interval apart. The page sees the button in event.buttons.
+// person's interval apart. The page sees the button in event.buttons, and
+// the hold as it was meant, not lengthened by a round trip.
 func (s *session) press(ctx context.Context, t *tab, button string, count int, mods input.Modifier) error {
 	btn, bits, err := mouseButton(button)
 	if err != nil {
@@ -376,94 +479,101 @@ func (s *session) press(ctx context.Context, t *tab, button string, count int, m
 		return errors.New("the pointer is nowhere yet")
 	}
 	r := s.rand()
-	cctx, cancel := context.WithTimeout(t.ctx, 10*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	return chromedp.Run(cctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		if err := sleepCtx(ctx, uniformDur(r, 70*time.Millisecond, 190*time.Millisecond)); err != nil {
+	hd, err := s.handOn(cctx, t)
+	if err != nil {
+		return err
+	}
+	click := func(typ string, buttons int64, n int) map[string]any {
+		ev := mouseEvent(typ, at)
+		ev["button"], ev["buttons"], ev["clickCount"], ev["modifiers"] = btn, buttons, n, mods
+		return ev
+	}
+	if err := sleepCtx(cctx, uniformDur(r, 70*time.Millisecond, 190*time.Millisecond)); err != nil {
+		return err
+	}
+	var sent []<-chan error
+	for i := 1; i <= count; i++ {
+		sent = append(sent, hd.send(cctx, "Input.dispatchMouseEvent", click("mousePressed", bits, i)))
+		if err := sleepCtx(cctx, uniformDur(r, 55*time.Millisecond, 125*time.Millisecond)); err != nil {
 			return err
 		}
-		for i := 1; i <= count; i++ {
-			if err := input.DispatchMouseEvent(input.MousePressed, at.X, at.Y).WithButton(btn).WithButtons(bits).
-				WithClickCount(int64(i)).WithModifiers(mods).WithPointerType(input.Mouse).Do(ctx); err != nil {
+		sent = append(sent, hd.send(cctx, "Input.dispatchMouseEvent", click("mouseReleased", 0, i)))
+		if i < count {
+			if err := sleepCtx(cctx, uniformDur(r, 70*time.Millisecond, 150*time.Millisecond)); err != nil {
 				return err
-			}
-			if err := sleepCtx(ctx, uniformDur(r, 55*time.Millisecond, 125*time.Millisecond)); err != nil {
-				return err
-			}
-			if err := input.DispatchMouseEvent(input.MouseReleased, at.X, at.Y).WithButton(btn).WithButtons(0).
-				WithClickCount(int64(i)).WithModifiers(mods).WithPointerType(input.Mouse).Do(ctx); err != nil {
-				return err
-			}
-			if i < count {
-				if err := sleepCtx(ctx, uniformDur(r, 70*time.Millisecond, 150*time.Millisecond)); err != nil {
-					return err
-				}
 			}
 		}
-		return nil
-	}))
+	}
+	return s.taken(cctx, t, sent)
 }
 
 // wheel scrolls by dx, dy px with trackpad swipes where the pointer is,
-// vertical first. It returns once the last swipe's momentum is spent and
-// the page has had a moment to follow.
+// vertical first. It returns once the page has taken the last swipe and had
+// a moment to follow it.
 func (s *session) wheel(ctx context.Context, t *tab, dx, dy float64) error {
 	at, known := s.ptr.get()
 	if !known {
 		return errors.New("the pointer is nowhere yet")
 	}
 	r := s.rand()
-	cctx, cancel := context.WithTimeout(t.ctx, 60*time.Second)
+	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	return chromedp.Run(cctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		for _, axis := range []struct {
-			total    float64
-			vertical bool
-		}{{dy, true}, {dx, false}} {
-			for i, sw := range planSwipes(r, axis.total) {
-				if i > 0 {
-					if err := sleepCtx(ctx, sw.pause); err != nil {
-						return err
-					}
+	hd, err := s.handOn(cctx, t)
+	if err != nil {
+		return err
+	}
+	var sent []<-chan error
+	for _, axis := range []struct {
+		total    float64
+		vertical bool
+	}{{dy, true}, {dx, false}} {
+		for i, sw := range planSwipes(r, axis.total) {
+			if i > 0 {
+				if err := sleepCtx(cctx, sw.pause); err != nil {
+					return err
 				}
-				start, done := time.Now(), 0.0
-				for {
-					u := math.Min(1, float64(time.Since(start))/float64(sw.dur))
-					step := sw.dist*sw.frac(u) - done
-					if u < 1 {
-						// Reports are uneven; what one leaves out the next makes up.
-						step *= uniform(r, 0.85, 1.15)
+			}
+			start, done := time.Now(), 0.0
+			for {
+				u := math.Min(1, float64(time.Since(start))/float64(sw.dur))
+				step := sw.dist*sw.frac(u) - done
+				if u < 1 {
+					// Reports are uneven; what one leaves out the next makes up.
+					step *= uniform(r, 0.85, 1.15)
+				}
+				step = math.Round(step)
+				if step*sw.dist < 0 { // never back
+					step = 0
+				}
+				if math.Abs(done+step) > math.Abs(sw.dist) || u == 1 { // never past the end, and end on it
+					step = sw.dist - done
+				}
+				if step != 0 {
+					ev := mouseEvent("mouseWheel", at)
+					ev["deltaX"], ev["deltaY"] = 0.0, 0.0
+					if axis.vertical {
+						ev["deltaY"] = step
+					} else {
+						ev["deltaX"] = step
 					}
-					step = math.Round(step)
-					if step*sw.dist < 0 { // never back
-						step = 0
-					}
-					if math.Abs(done+step) > math.Abs(sw.dist) || u == 1 { // never past the end, and end on it
-						step = sw.dist - done
-					}
-					if step != 0 {
-						ev := input.DispatchMouseEvent(input.MouseWheel, at.X, at.Y).WithPointerType(input.Mouse)
-						if axis.vertical {
-							ev = ev.WithDeltaX(0).WithDeltaY(step)
-						} else {
-							ev = ev.WithDeltaX(step).WithDeltaY(0)
-						}
-						if err := ev.Do(ctx); err != nil {
-							return err
-						}
-						done += step
-					}
-					if u == 1 {
-						break
-					}
-					if err := sleepCtx(ctx, s.tick()); err != nil {
-						return err
-					}
+					sent = append(sent, hd.send(cctx, "Input.dispatchMouseEvent", ev))
+					done += step
+				}
+				if u == 1 {
+					break
+				}
+				if err := sleepCtx(cctx, s.tick()); err != nil {
+					return err
 				}
 			}
 		}
-		return sleepCtx(ctx, uniformDur(r, 150*time.Millisecond, 300*time.Millisecond))
-	}))
+	}
+	if err := s.taken(cctx, t, sent); err != nil {
+		return err
+	}
+	return sleepCtx(cctx, uniformDur(r, 150*time.Millisecond, 300*time.Millisecond))
 }
 
 // ---- acting on targets ----

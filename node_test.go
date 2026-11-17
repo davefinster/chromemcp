@@ -411,12 +411,13 @@ func TestNodeSessionIntegration(t *testing.T) {
 		if out != "rows.csv@8" {
 			t.Errorf("the page got %q", out)
 		}
-		// A download lands on the node and is listed through it.
-		res, err := resolveTarget(ctx, tb, targetSpec{Selector: "#dl"})
-		if err != nil {
+		// A download lands on the node and is listed through it. The click
+		// is the hand's, whose own DevTools connection goes through the
+		// relay too (human.go).
+		if _, err := s.pointAt(ctx, tb, targetSpec{Selector: "#dl"}); err != nil {
 			return err
 		}
-		return clickAt(ctx, tb, res.X, res.Y, "left", 1, 0)
+		return s.press(ctx, tb, "left", 1, 0)
 	})
 	if err != nil {
 		t.Fatal(err)

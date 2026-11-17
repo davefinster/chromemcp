@@ -137,8 +137,10 @@ claude.ai ──HTTPS──▶ edge ──▶ chromemcp :8787
   burst of wheel events that ramps up and decays like momentum, made over
   the scroller that holds it, where the pointer is if a wheel there reaches
   it. A page that takes the wheel for itself gets the old jump after two
-  swipes that move nothing. Movement is sampled against the clock, so a slow
-  DevTools link (a node's) sends fewer events at the same speed. Coordinates
+  swipes that move nothing. The hand reports at its own pace, about 60 a
+  second. It sends on the session's own DevTools connection without waiting
+  for each reply, so a node's link, with its ~100 ms round trip, gets the
+  same rate as a local Chrome. Coordinates
   given to `browser_click` are clicked exactly. Typing is still one input
   event per call.
 - **Headless tabs that are not in front are hidden** to Chrome and stop
@@ -657,7 +659,8 @@ list against the algorithm; and `TestHumanInput` / `TestHumanTools`: what a
 page records of the hand, which is a curved path that slows onto the target,
 press points that differ, a held button, swipes of uneven size that add up to
 what was asked, and a button in a scrolling box wheeled to over the box, then
-the same through the tools; and `TestUploadIntegration` / `TestUploadTools`:
+the same through the tools; `TestHumanOverSlowLink` checks the hand's rate and
+button hold through a proxy that adds a node's round trip; and `TestUploadIntegration` / `TestUploadTools`:
 the three shapes a site asks for a file in — a plain input, a hidden one
 behind its styled label, and a button that builds its input only when
 clicked — checked by what the page's own `change` handler reports, the

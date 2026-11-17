@@ -4,8 +4,11 @@ import (
 	"context"
 	"math"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -445,5 +448,128 @@ func TestHumanTools(t *testing.T) {
 	}
 	if p, _ := s.ptr.get(); p != (pt{123, 45}) {
 		t.Errorf("pointer at %v after clicking (123, 45)", p)
+	}
+}
+
+// slowProxy forwards TCP to addr with delay added in each direction, in
+// order: a node's link, about 100 ms there and back.
+func slowProxy(t *testing.T, addr string, delay time.Duration) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	pipe := func(dst, src net.Conn) {
+		type chunk struct {
+			b  []byte
+			at time.Time
+		}
+		ch := make(chan chunk, 4096)
+		go func() {
+			defer close(ch)
+			for {
+				b := make([]byte, 32<<10)
+				n, err := src.Read(b)
+				if n > 0 {
+					ch <- chunk{b[:n], time.Now().Add(delay)}
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		for c := range ch {
+			time.Sleep(time.Until(c.at))
+			if _, err := dst.Write(c.b); err != nil {
+				break
+			}
+		}
+		dst.Close()
+		src.Close()
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			up, err := net.Dial("tcp", addr)
+			if err != nil {
+				c.Close()
+				continue
+			}
+			go pipe(up, c)
+			go pipe(c, up)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// Over a slow link the hand still reports at a hand's rate: the reports go
+// out without waiting for each reply. Waiting spaced them by the round
+// trip, so a node's moves came in jumps and its swipes in huge wheels.
+func TestHumanOverSlowLink(t *testing.T) {
+	mgr := testChrome(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(humanTestPage)) }))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	s, err := mgr.start(ctx, startOptions{Device: nativeDevice})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var l handLog
+	err = mgr.withTab(ctx, s.meta.ID, "", func(ctx context.Context, s *session, tb *tab) error {
+		if err := navigate(ctx, tb, srv.URL, 20*time.Second); err != nil {
+			return err
+		}
+		// Only the hand goes the slow way.
+		u, err := url.Parse(*s.cdpURL.Load())
+		if err != nil {
+			return err
+		}
+		u.Host = slowProxy(t, u.Host, 50*time.Millisecond)
+		slow := u.String()
+		s.cdpURL.Store(&slow)
+		s.ptr.set(pt{60, 560})
+		if _, err := s.pointAt(ctx, tb, targetSpec{Selector: "#b"}); err != nil {
+			return err
+		}
+		if err := s.press(ctx, tb, "left", 1, 0); err != nil {
+			return err
+		}
+		if _, _, err := s.scrollPage(ctx, tb, 0, 700); err != nil {
+			return err
+		}
+		time.Sleep(300 * time.Millisecond)
+		return evalJSON(ctx, tb, "log", &l)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(l.Clicks) != 1 || l.Clicks[0][0] != "b" {
+		t.Errorf("clicks: %v", l.Clicks)
+	}
+	gaps := make([]float64, 0, len(l.Moves))
+	for i := 1; i < len(l.Moves); i++ {
+		gaps = append(gaps, l.Moves[i][2]-l.Moves[i-1][2])
+	}
+	sort.Float64s(gaps)
+	if len(gaps) < 8 || gaps[len(gaps)/2] > 40 {
+		t.Errorf("%d moves, median gap %v ms over a 100 ms link; want a hand's ~16", len(l.Moves), gaps)
+	}
+	var peak, sum float64
+	for _, w := range l.Wheels {
+		peak = math.Max(peak, math.Abs(w[1]))
+		sum += w[1]
+	}
+	if len(l.Wheels) < 15 || peak > 250 || sum != 700 {
+		t.Errorf("%d wheel events, the biggest %.0f px, adding up to %.0f", len(l.Wheels), peak, sum)
+	}
+	if len(l.Downs) == 1 && len(l.Ups) == 1 {
+		if held := l.Ups[0][3] - l.Downs[0][3]; held < 40 || held > 160 {
+			t.Errorf("button held %.0f ms; want the hand's 55-125, not a round trip more", held)
+		}
 	}
 }
