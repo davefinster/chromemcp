@@ -87,18 +87,14 @@ func (h *viewHandler) cast(w http.ResponseWriter, r *http.Request, sid string) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	s.mu.Lock()
-	running := s.isRunning()
-	var wsURL string
-	var current target.ID
-	if running {
-		wsURL, current = s.chrome.wsURL(), s.current
-	}
-	s.mu.Unlock()
-	if !running {
+	// Not s.mu: an agent's action holds it for as long as it runs, often a
+	// browser_wait for the sign-in this view is opened to do (session.go).
+	wsURL := s.cdpURL.Load()
+	if wsURL == nil {
 		http.Error(w, "the session is parked; any browser tool resumes it, then reload this page", http.StatusConflict)
 		return
 	}
+	current := s.liveTab()
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		// The page and the socket share an origin (the token URL), as for
 		// the noVNC bridge.
@@ -112,7 +108,7 @@ func (h *viewHandler) cast(w http.ResponseWriter, r *http.Request, sid string) {
 	c.SetReadLimit(1 << 20)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	cc, err := dialCDP(ctx, wsURL, logf)
+	cc, err := dialCDP(ctx, *wsURL, logf)
 	if err != nil {
 		c.Close(websocket.StatusInternalError, "devtools: "+err.Error())
 		return

@@ -153,11 +153,8 @@ func (h *viewHandler) bridge(w http.ResponseWriter, r *http.Request, sid string)
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	s.mu.Lock()
-	disp := s.disp
-	running := s.isRunning()
-	s.mu.Unlock()
-	if !running || disp == nil {
+	disp := s.vnc.Load() // not s.mu, as for the screencast view (castview.go)
+	if disp == nil {
 		http.Error(w, "the session is not running headful; resume it (session_resume) and ask for a new link", http.StatusConflict)
 		return
 	}

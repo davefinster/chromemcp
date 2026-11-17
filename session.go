@@ -113,10 +113,30 @@ type session struct {
 	devtools   *devtoolsClient
 	viewers    atomic.Int32 // open live-view connections
 	lastUsed   atomic.Int64 // unix nanos; the meta's copy is written on park
-	// cdpURL is chrome's DevTools URL while it runs, for what must not wait
-	// on s.mu, which an agent's action holds for as long as it runs: a paste
-	// from the live view during a browser_wait for that very sign-in.
-	cdpURL atomic.Pointer[string]
+	// What the live view reads, kept outside s.mu, because an agent's action
+	// holds s.mu for as long as it runs. The live view must not wait on that
+	// lock: an agent's browser_wait is often waiting for the very sign-in the
+	// person is doing in the view. Waiting on it there held the view's
+	// websocket upgrade for the whole of the wait (paste.go, castview.go,
+	// view.go). cdpURL is chrome's DevTools URL and vnc its display, both
+	// while it runs. viewTab is s.current, set only through setCurrent.
+	cdpURL  atomic.Pointer[string]
+	vnc     atomic.Pointer[display]
+	viewTab atomic.Pointer[target.ID]
+}
+
+// setCurrent changes the current tab and the live view's copy of it.
+func (s *session) setCurrent(id target.ID) {
+	s.current = id
+	s.viewTab.Store(&id)
+}
+
+// liveTab is the current tab as the live view reads it, without s.mu.
+func (s *session) liveTab() target.ID {
+	if p := s.viewTab.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // tab is one attached page target.
@@ -801,12 +821,13 @@ func (s *session) launch(ctx context.Context) error {
 	s.chrome, s.disp, s.emu = proc, disp, emu
 	u := proc.wsURL()
 	s.cdpURL.Store(&u)
+	s.vnc.Store(disp)
 	s.allocCtx, s.allocStop, s.browserCtx = allocCtx, allocStop, browserCtx
 	s.tabs = map[target.ID]*tab{}
 	s.closing = map[target.ID]time.Time{}
 	s.aliases = map[string]target.ID{}
 	s.nextTab = 0
-	s.current = ""
+	s.setCurrent("")
 
 	connect := func() error {
 		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -857,7 +878,7 @@ func (s *session) launch(ctx context.Context) error {
 				}
 			}
 			if first != nil {
-				s.current = first.id
+				s.setCurrent(first.id)
 			}
 		}
 		return nil
@@ -923,7 +944,9 @@ func (s *session) park() {
 	}
 	s.chrome, s.disp, s.emu, s.allocCtx, s.allocStop, s.browserCtx = nil, nil, nil, nil, nil, nil
 	s.cdpURL.Store(nil)
-	s.tabs, s.closing, s.aliases, s.current, s.front = nil, nil, nil, "", ""
+	s.vnc.Store(nil)
+	s.tabs, s.closing, s.aliases, s.front = nil, nil, nil, ""
+	s.setCurrent("")
 	if err := s.saveMeta(); err != nil {
 		logf("session %s: saving metadata: %v", s.meta.ID, err)
 	}
@@ -971,7 +994,7 @@ func (s *session) syncTabs(ctx context.Context) error {
 		}
 	}
 	if _, ok := s.tabs[s.current]; !ok {
-		s.current = ""
+		s.setCurrent("")
 		// The oldest surviving tab.
 		var best *tab
 		for _, t := range s.tabs {
@@ -980,7 +1003,7 @@ func (s *session) syncTabs(ctx context.Context) error {
 			}
 		}
 		if best != nil {
-			s.current = best.id
+			s.setCurrent(best.id)
 		}
 	}
 	return nil
@@ -1015,7 +1038,7 @@ func (s *session) adopt(ctx context.Context, id target.ID) error {
 	s.tabs[id] = t
 	s.aliases[t.alias] = id
 	if s.current == "" {
-		s.current = id
+		s.setCurrent(id)
 	}
 	chromedp.ListenTarget(tctx, func(ev any) {
 		switch ev := ev.(type) {
@@ -1056,7 +1079,7 @@ func (s *session) newTab(ctx context.Context, url string) (*tab, error) {
 	if err := s.adopt(ctx, id); err != nil {
 		return nil, err
 	}
-	s.current = id
+	s.setCurrent(id)
 	t := s.tabs[id]
 	if url != "" && url != "about:blank" {
 		if err := navigate(ctx, t, url, 30*time.Second); err != nil {
@@ -1091,7 +1114,7 @@ func (s *session) closeTab(ctx context.Context, t *tab) error {
 	s.closing[t.id] = time.Now()
 	t.cancel() // chromedp closes the target on cancel
 	if s.current == t.id {
-		s.current = ""
+		s.setCurrent("")
 	}
 	return s.syncTabs(ctx)
 }

@@ -766,7 +766,7 @@ func waitFor(ctx context.Context, t *tab, w waitSpec, timeout time.Duration) (st
 
 // bringToFront makes a tab the visible one and the current one.
 func (s *session) bringToFront(ctx context.Context, t *tab) error {
-	s.current = t.id
+	s.setCurrent(t.id)
 	cctx, cancel := context.WithTimeout(t.ctx, 5*time.Second)
 	defer cancel()
 	err := chromedp.Run(cctx, chromedp.ActionFunc(func(ctx context.Context) error {

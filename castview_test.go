@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -119,9 +120,28 @@ func TestCastView(t *testing.T) {
 		}
 	}
 
-	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(views.URL, "http")+"/view/"+tok+"/cast.ws", nil)
+	// The view connects, and shows the page, while an agent's action holds
+	// the session: the browser_wait for the sign-in the view was opened to
+	// do. It used to wait on the session's lock before upgrading, so the
+	// page sat at "connecting…" until the action ended.
+	held, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	letGo := func() { releaseOnce.Do(func() { close(release) }) }
+	defer letGo()
+	waited := make(chan error, 1)
+	go func() {
+		waited <- mgr.withTab(ctx, s.meta.ID, "", func(ctx context.Context, s *session, tb *tab) error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	dctx, dcancel := context.WithTimeout(ctx, 10*time.Second)
+	c, _, err := websocket.Dial(dctx, "ws"+strings.TrimPrefix(views.URL, "http")+"/view/"+tok+"/cast.ws", nil)
+	dcancel()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("connecting while an action holds the session: %v", err)
 	}
 	defer c.CloseNow()
 	c.SetReadLimit(16 << 20)
@@ -147,6 +167,10 @@ func TestCastView(t *testing.T) {
 		case "tabs":
 			sawTabs = len(m.Tabs) == 1 && m.Tabs[0].Current && m.Tabs[0].Title == "Cast"
 		}
+	}
+	letGo()
+	if err := <-waited; err != nil {
+		t.Fatal(err)
 	}
 	if s.viewers.Load() != 1 {
 		t.Errorf("viewers = %d while watching", s.viewers.Load())
