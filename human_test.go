@@ -131,19 +131,23 @@ body { margin: 0; font: 14px sans-serif }
 #b { position: absolute; left: 600px; top: 400px; width: 120px; height: 40px }
 #box { position: absolute; top: 80px; left: 40px; width: 300px; height: 150px; overflow: auto; border: 1px solid }
 #far { position: absolute; top: 2600px; left: 100px }
+#q { position: absolute; top: 20px; left: 420px; width: 200px }
 </style></head><body>
+<input id="q">
 <div id="box"><div style="height: 1200px"></div><button id="inner">Inner</button><div style="height: 100px"></div></div>
 <button id="b">Target</button>
 <button id="far">Far</button>
 <div style="height: 5000px"></div>
 <script>
-window.log = {moves: [], downs: [], ups: [], clicks: [], wheels: []};
+window.log = {moves: [], downs: [], ups: [], clicks: [], wheels: [], keys: []};
 const now = () => performance.now();
 addEventListener('mousemove', e => log.moves.push([e.clientX, e.clientY, now()]), true);
 addEventListener('mousedown', e => log.downs.push([e.clientX, e.clientY, e.buttons, now()]), true);
 addEventListener('mouseup', e => log.ups.push([e.clientX, e.clientY, e.buttons, now()]), true);
 addEventListener('click', e => log.clicks.push([e.target.id, e.clientX, e.clientY]), true);
 addEventListener('wheel', e => log.wheels.push([e.deltaX, e.deltaY, now()]), {capture: true, passive: true});
+addEventListener('keydown', e => log.keys.push([1, e.keyCode, e.timeStamp]), true);
+addEventListener('keyup', e => log.keys.push([0, e.keyCode, e.timeStamp]), true);
 </script></body></html>`
 
 type handLog struct {
@@ -152,6 +156,7 @@ type handLog struct {
 	Ups    [][4]float64 `json:"ups"`
 	Clicks [][3]any     `json:"clicks"`
 	Wheels [][3]float64 `json:"wheels"`
+	Keys   [][3]float64 `json:"keys"`
 }
 
 // What a page sees of the hand: the pointer travels a curved, uneven path
@@ -452,7 +457,7 @@ func TestHumanTools(t *testing.T) {
 }
 
 // slowProxy forwards TCP to addr with delay added in each direction, in
-// order: a node's link, about 100 ms there and back.
+// order: a node's link is about 100 ms there and back; the test uses 150.
 func slowProxy(t *testing.T, addr string, delay time.Duration) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -520,6 +525,7 @@ func TestHumanOverSlowLink(t *testing.T) {
 		t.Fatal(err)
 	}
 	var l handLog
+	var typed string
 	err = mgr.withTab(ctx, s.meta.ID, "", func(ctx context.Context, s *session, tb *tab) error {
 		if err := navigate(ctx, tb, srv.URL, 20*time.Second); err != nil {
 			return err
@@ -529,7 +535,7 @@ func TestHumanOverSlowLink(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		u.Host = slowProxy(t, u.Host, 50*time.Millisecond)
+		u.Host = slowProxy(t, u.Host, 75*time.Millisecond)
 		slow := u.String()
 		s.cdpURL.Store(&slow)
 		s.ptr.set(pt{60, 560})
@@ -542,13 +548,25 @@ func TestHumanOverSlowLink(t *testing.T) {
 		if _, _, err := s.scrollPage(ctx, tb, 0, 700); err != nil {
 			return err
 		}
+		if _, err := s.pointAt(ctx, tb, targetSpec{Selector: "#q"}); err != nil {
+			return err
+		}
+		if err := s.press(ctx, tb, "left", 1, 0); err != nil {
+			return err
+		}
+		if _, err := s.typeKeys(ctx, tb, "hello world"); err != nil {
+			return err
+		}
 		time.Sleep(300 * time.Millisecond)
+		if err := evalJSON(ctx, tb, "document.getElementById('q').value", &typed); err != nil {
+			return err
+		}
 		return evalJSON(ctx, tb, "log", &l)
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(l.Clicks) != 1 || l.Clicks[0][0] != "b" {
+	if len(l.Clicks) != 2 || l.Clicks[0][0] != "b" || l.Clicks[1][0] != "q" {
 		t.Errorf("clicks: %v", l.Clicks)
 	}
 	gaps := make([]float64, 0, len(l.Moves))
@@ -562,14 +580,40 @@ func TestHumanOverSlowLink(t *testing.T) {
 	var peak, sum float64
 	for _, w := range l.Wheels {
 		peak = math.Max(peak, math.Abs(w[1]))
-		sum += w[1]
+		if w[1] > 0 { // down the page; the swipes back up reach the field
+			sum += w[1]
+		}
 	}
 	if len(l.Wheels) < 15 || peak > 250 || sum != 700 {
 		t.Errorf("%d wheel events, the biggest %.0f px, adding up to %.0f", len(l.Wheels), peak, sum)
 	}
-	if len(l.Downs) == 1 && len(l.Ups) == 1 {
+	if len(l.Downs) >= 1 && len(l.Ups) >= 1 {
 		if held := l.Ups[0][3] - l.Downs[0][3]; held < 40 || held > 160 {
 			t.Errorf("button held %.0f ms; want the hand's 55-125, not a round trip more", held)
 		}
+	}
+	// Keys too: held as a finger holds them, a typist's gaps apart.
+	if typed != "hello world" {
+		t.Errorf("typed %q over the slow link", typed)
+	}
+	downAt := map[float64]float64{}
+	var holds, keyGaps []float64
+	last := -1.0
+	for _, k := range l.Keys {
+		if k[0] == 1 {
+			downAt[k[1]] = k[2]
+			if last >= 0 {
+				keyGaps = append(keyGaps, k[2]-last)
+			}
+			last = k[2]
+		} else if at, ok := downAt[k[1]]; ok {
+			holds = append(holds, k[2]-at)
+			delete(downAt, k[1])
+		}
+	}
+	sort.Float64s(holds)
+	sort.Float64s(keyGaps)
+	if len(holds) < 11 || holds[len(holds)/2] > 140 || len(keyGaps) < 10 || keyGaps[len(keyGaps)/2] > 400 {
+		t.Errorf("over the slow link, keys held %v ms, %v ms apart", holds, keyGaps)
 	}
 }

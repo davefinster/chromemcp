@@ -73,7 +73,7 @@ screenshot, `screenshot=false` turns it off)
 | `browser_snapshot` | the page's interactive elements with a ref each (`e12`), role, label, value, position; `labels=true` draws them on a screenshot |
 | `browser_screenshot` | viewport, full page, or one element; jpeg/png, quality, downscale, ref labels |
 | `browser_click`, `browser_hover` | by ref, visible text, CSS selector, or viewport coordinates; the pointer moves there as a hand does and clicks a random point on the element |
-| `browser_type`, `browser_press`, `browser_select` | type into a field (optionally clear, submit); press keys with modifiers; choose a `<select>` option |
+| `browser_type`, `browser_press`, `browser_select` | type into a field key by key at a person's pace (optionally clear, submit); press keys with modifiers; choose a `<select>` option |
 | `browser_scroll` | scroll the page with trackpad-like wheel swipes, or bring an element into view |
 | `browser_upload` | give the page files from the session (`file_list` shows them, put or downloaded) as the file dialog would — the input itself, a hidden one behind its label, or the button whose file chooser is caught |
 | `browser_wait` | a delay, or until an element / text appears (or disappears), or the URL changes |
@@ -141,8 +141,18 @@ claude.ai ──HTTPS──▶ edge ──▶ chromemcp :8787
   second. It sends on the session's own DevTools connection without waiting
   for each reply, so a node's link, with its ~100 ms round trip, gets the
   same rate as a local Chrome. Coordinates
-  given to `browser_click` are clicked exactly. Typing is still one input
-  event per call.
+  given to `browser_click` are clicked exactly.
+- **Typing is a typist's** (`typing.go`). Each session gets one typist, about
+  65–110 words a minute. Every key goes down and comes up, with a DOM
+  keyCode and code and a held duration. Gaps vary: quicker across hands,
+  slower on the same finger, longer after punctuation, with the odd pause.
+  A fast typist rolls over keys. Shift is a key of its own around capitals
+  and symbols. A clear is select-all and Backspace (⌘A with its editing
+  command on a Mac). `browser_press` presses a chord's modifiers as keys.
+  Characters with no US key (é, emoji) are inserted whole, as an IME
+  would. A newline is Enter in a textarea or editor and is dropped in a
+  one-line field. Text over 160 characters is pasted in one go, so a call
+  does not type for minutes.
 - **Headless tabs that are not in front are hidden** to Chrome and stop
   rendering — a screenshot of one waits for a frame that never comes. Every
   operation brings its tab to the front first.
@@ -368,9 +378,8 @@ canvas and audio rendering, the media devices and speech voices, and above
 all the WebGL *rendering* — the renderer string says GeForce, but the pixels
 and the capabilities behind it are SwiftShader's, which a script that hashes a
 WebGL draw or reads its limits can still tell apart from real hardware. Nor
-does it supply all of a person's behaviour: the pointer and scrolling are a
-hand's (above), but typing has no keystroke rhythm and a fresh profile has no
-interaction history. Anti-bot services that weigh those — Cloudflare, and the
+does it supply all of a person's behaviour: the pointer, scrolling and typing
+are a person's (above), but a fresh profile has no interaction history. Anti-bot services that weigh those — Cloudflare, and the
 PerimeterX/HUMAN "press and hold" that Walmart runs — can still challenge a
 session the fingerprint alone would pass, especially a "cold" one with no
 interaction, and their verdict is probabilistic and reputation-weighted. The
@@ -659,8 +668,13 @@ list against the algorithm; and `TestHumanInput` / `TestHumanTools`: what a
 page records of the hand, which is a curved path that slows onto the target,
 press points that differ, a held button, swipes of uneven size that add up to
 what was asked, and a button in a scrolling box wheeled to over the box, then
-the same through the tools; `TestHumanOverSlowLink` checks the hand's rate and
-button hold through a proxy that adds a node's round trip; and `TestUploadIntegration` / `TestUploadTools`:
+the same through the tools; `TestHumanOverSlowLink` checks the hand's rate,
+button hold and key holds through a proxy that adds a round trip longer than
+a node's; `TestTypingPlan` / `TestTypingRhythm` / `TestTypingTools`: a plan
+that types exactly the text, with Shift only between keys, an uneven rhythm
+with rollover, and, on a real page, trusted key events with real keyCodes, a
+clear by Backspace, Enter in a textarea, inserted accents, a chord's
+modifiers, and a long text pasted; and `TestUploadIntegration` / `TestUploadTools`:
 the three shapes a site asks for a file in — a plain input, a hidden one
 behind its styled label, and a button that builds its input only when
 clicked — checked by what the page's own `change` handler reports, the

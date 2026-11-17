@@ -21,6 +21,7 @@ import (
 
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/chromedp"
+	"github.com/chromedp/chromedp/kb"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -542,12 +543,13 @@ func (a *mcpApp) register(s *mcp.Server) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "browser_type",
 		Description: "Type text into a field: clicks it (ref / text / selector), optionally clears it, types, and optionally presses Enter. " +
-			"Without a target, types into whatever is focused.",
+			"Without a target, types into whatever is focused. Typed key by key at a person's pace, about seven keys a second; " +
+			fmt.Sprintf("text longer than %d characters goes in at once, as pasted.", typeMax),
 		Annotations: acts("Type"),
 	}, a.typeText)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "browser_press",
-		Description: "Press a key, with modifiers: Enter, Tab, Escape, ArrowDown, Backspace, Control+a, Shift+Tab, F5…",
+		Description: "Press a key, with modifiers: Enter, Tab, Escape, ArrowDown, Backspace, Control+a, Shift+Tab, F5… The modifiers are pressed as keys of their own. On device=mac, ⌘ shortcuts are Meta (Meta+a selects all).",
 		Annotations: acts("Press a key"),
 	}, a.press)
 	mcp.AddTool(s, &mcp.Tool{
@@ -1245,35 +1247,32 @@ func (a *mcpApp) typeText(ctx context.Context, req *mcp.CallToolRequest, in type
 				return fmt.Errorf("focusing %s: %w", res.describe(), err)
 			}
 			r.addf("into %s", res.describe())
-			if in.Clear {
-				var ok bool
-				if err := evalJSON(ctx, t, jsCall("clearField", in.targetSpec), &ok); err == nil && !ok {
-					// Not a field we know how to empty: select-all and delete.
-					if k, m, err := parseKey("Control+a"); err == nil {
-						pressKey(ctx, t, k, m)
-					}
-					if k, m, err := parseKey("Delete"); err == nil {
-						pressKey(ctx, t, k, m)
-					}
-				}
+			// The hand goes from the mouse to the keyboard.
+			if err := sleepCtx(ctx, uniformDur(s.rand(), 250*time.Millisecond, 600*time.Millisecond)); err != nil {
+				return err
 			}
-		} else if in.Clear {
-			if k, m, err := parseKey("Control+a"); err == nil {
-				pressKey(ctx, t, k, m)
-			}
-			if k, m, err := parseKey("Delete"); err == nil {
-				pressKey(ctx, t, k, m)
+		}
+		if in.Clear {
+			if err := s.clearFocused(ctx, t, in.targetSpec); err != nil {
+				return fmt.Errorf("clearing: %w", err)
 			}
 		}
 		if in.Text != "" {
-			if err := insertText(ctx, t, in.Text); err != nil {
+			pasted, err := s.typeKeys(ctx, t, in.Text)
+			if err != nil {
 				return fmt.Errorf("typing: %w", err)
 			}
+			if pasted {
+				r.addf("pasted %q (longer than %d characters is pasted, not typed)", truncate(in.Text, 200), typeMax)
+			} else {
+				r.addf("typed %q", truncate(in.Text, 200))
+			}
 		}
-		r.addf("typed %q", truncate(in.Text, 200))
 		if in.Submit {
-			k, m, _ := parseKey("Enter")
-			if err := pressKey(ctx, t, k, m); err != nil {
+			if err := sleepCtx(ctx, uniformDur(s.rand(), 200*time.Millisecond, 600*time.Millisecond)); err != nil {
+				return err
+			}
+			if err := s.pressChord(ctx, t, kb.Keys['\r'], 0, 1); err != nil {
 				return fmt.Errorf("pressing Enter: %w", err)
 			}
 			r.addf("pressed Enter")
@@ -1302,10 +1301,8 @@ func (a *mcpApp) press(ctx context.Context, req *mcp.CallToolRequest, in pressIn
 	}
 	r := &result{}
 	err = a.mgr.withTab(ctx, in.SessionID, in.Tab, func(ctx context.Context, s *session, t *tab) error {
-		for i := 0; i < n; i++ {
-			if err := pressKey(ctx, t, k, mods); err != nil {
-				return fmt.Errorf("pressing %s: %w", in.Key, err)
-			}
+		if err := s.pressChord(ctx, t, k, mods, n); err != nil {
+			return fmt.Errorf("pressing %s: %w", in.Key, err)
 		}
 		time.Sleep(200 * time.Millisecond)
 		settle(ctx, t, 5*time.Second)
